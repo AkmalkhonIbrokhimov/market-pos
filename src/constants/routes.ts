@@ -5,6 +5,8 @@ export const ROUTES = {
   OWNER_PRODUCTS: "/owner/products",
   OWNER_NEW_PRODUCT: "/owner/products/new",
   OWNER_CATEGORIES: "/owner/categories",
+  OWNER_STOCK_INCOME: "/owner/stock/income",
+  OWNER_STOCK_INCOME_HISTORY: "/owner/stock/income/history",
   SELLER_POS: "/seller/pos",
 } as const;
 
