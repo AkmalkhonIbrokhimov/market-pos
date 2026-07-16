@@ -1,5 +1,46 @@
 import type { User } from "@supabase/supabase-js";
 
-export async function getCurrentUser(): Promise<User | null> {
-  return null;
+import { isRole, type Role } from "@/constants/roles";
+import { createClient } from "@/lib/supabase/server";
+
+export type CurrentUser = {
+  authUser: User;
+  profile: {
+    id: string;
+    fullName: string;
+    email: string | null;
+    role: Role;
+  };
+};
+
+export async function getCurrentUser(): Promise<CurrentUser | null> {
+  const supabase = await createClient();
+  const {
+    data: { user: authUser },
+    error: authError,
+  } = await supabase.auth.getUser();
+
+  if (authError || !authUser) {
+    return null;
+  }
+
+  const { data: profile, error: profileError } = await supabase
+    .from("users")
+    .select("id, full_name, email, role, status")
+    .eq("auth_user_id", authUser.id)
+    .maybeSingle();
+
+  if (profileError || !profile || profile.status !== "active" || !isRole(profile.role)) {
+    return null;
+  }
+
+  return {
+    authUser,
+    profile: {
+      id: profile.id,
+      fullName: profile.full_name,
+      email: profile.email,
+      role: profile.role,
+    },
+  };
 }
