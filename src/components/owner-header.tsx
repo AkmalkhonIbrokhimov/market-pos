@@ -24,6 +24,18 @@ export function OwnerHeader({ dictionary }: { dictionary: Dictionary }) {
           >
             {dictionary.navigation.categories}
           </Link>
+          <Link
+            href={ROUTES.OWNER_STOCK_INCOME}
+            className="text-sm font-semibold text-slate-700 hover:text-emerald-700"
+          >
+            {dictionary.stock.income}
+          </Link>
+          <Link
+            href={ROUTES.OWNER_STOCK_INCOME_HISTORY}
+            className="text-sm font-semibold text-slate-700 hover:text-emerald-700"
+          >
+            {dictionary.stock.history}
+          </Link>
           <LogoutButton label={dictionary.navigation.logout} />
         </nav>
       </div>
