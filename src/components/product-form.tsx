@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useActionState } from "react";
 
 import { ROUTES } from "@/constants/routes";
+import type { Dictionary } from "@/i18n/types";
 import { createProduct, updateProduct } from "@/lib/products/actions";
 import type { CatalogActionState, Category, ProductFormValue } from "@/types/catalog";
 
@@ -11,10 +12,11 @@ const INITIAL_STATE: CatalogActionState = { error: null };
 
 type ProductFormProps = {
   categories: Category[];
+  dictionary: Dictionary;
   product?: ProductFormValue;
 };
 
-export function ProductForm({ categories, product }: ProductFormProps) {
+export function ProductForm({ categories, dictionary, product }: ProductFormProps) {
   const action = product ? updateProduct : createProduct;
   const [state, formAction, isPending] = useActionState(action, INITIAL_STATE);
 
@@ -24,7 +26,7 @@ export function ProductForm({ categories, product }: ProductFormProps) {
 
       <div className="grid gap-5 md:grid-cols-2">
         <label className="block text-sm font-semibold text-slate-700 md:col-span-2">
-          Product name
+          {dictionary.catalog.productName}
           <input
             required
             name="name"
@@ -35,13 +37,13 @@ export function ProductForm({ categories, product }: ProductFormProps) {
         </label>
 
         <label className="block text-sm font-semibold text-slate-700">
-          Category
+          {dictionary.common.category}
           <select
             name="category_id"
             defaultValue={product?.categoryId ?? ""}
             className="mt-2 block w-full border border-slate-300 bg-white px-3 py-2.5 font-normal text-slate-950 outline-none focus:border-emerald-600 focus:ring-2 focus:ring-emerald-100"
           >
-            <option value="">No category</option>
+            <option value="">{dictionary.common.noCategory}</option>
             {categories.map((category) => (
               <option key={category.id} value={category.id}>
                 {category.name}
@@ -51,7 +53,7 @@ export function ProductForm({ categories, product }: ProductFormProps) {
         </label>
 
         <label className="block text-sm font-semibold text-slate-700">
-          Barcode
+          {dictionary.common.barcode}
           <input
             name="barcode"
             defaultValue={product?.barcode ?? ""}
@@ -61,7 +63,7 @@ export function ProductForm({ categories, product }: ProductFormProps) {
         </label>
 
         <label className="block text-sm font-semibold text-slate-700">
-          Unit
+          {dictionary.common.unit}
           <input
             required
             name="unit"
@@ -71,7 +73,7 @@ export function ProductForm({ categories, product }: ProductFormProps) {
         </label>
 
         <label className="block text-sm font-semibold text-slate-700">
-          Sale price
+          {dictionary.common.salePrice}
           <input
             required
             name="sale_price"
@@ -84,7 +86,7 @@ export function ProductForm({ categories, product }: ProductFormProps) {
         </label>
 
         <label className="block text-sm font-semibold text-slate-700">
-          Minimum quantity
+          {dictionary.common.minimumQuantity}
           <input
             required
             name="min_quantity"
@@ -97,14 +99,14 @@ export function ProductForm({ categories, product }: ProductFormProps) {
         </label>
 
         <label className="block text-sm font-semibold text-slate-700">
-          Status
+          {dictionary.common.status}
           <select
             name="status"
             defaultValue={product?.status ?? "active"}
             className="mt-2 block w-full border border-slate-300 bg-white px-3 py-2.5 font-normal text-slate-950 outline-none focus:border-emerald-600 focus:ring-2 focus:ring-emerald-100"
           >
-            <option value="active">Active</option>
-            <option value="inactive">Inactive</option>
+            <option value="active">{dictionary.common.active}</option>
+            <option value="inactive">{dictionary.common.inactive}</option>
           </select>
         </label>
 
@@ -115,12 +117,12 @@ export function ProductForm({ categories, product }: ProductFormProps) {
             defaultChecked={product?.isExpirable ?? false}
             className="size-4 accent-emerald-700"
           />
-          Product has an expiry date
+          {dictionary.catalog.expirable}
         </label>
       </div>
 
       <p className="mt-5 text-sm text-slate-500">
-        Current quantity is managed separately through stock operations and cannot be changed here.
+        {dictionary.catalog.quantityNote}
       </p>
 
       {state.error ? (
@@ -135,13 +137,17 @@ export function ProductForm({ categories, product }: ProductFormProps) {
           disabled={isPending}
           className="min-h-11 bg-emerald-700 px-5 py-2.5 text-sm font-bold text-white hover:bg-emerald-800 disabled:cursor-not-allowed disabled:opacity-60"
         >
-          {isPending ? "Saving..." : product ? "Save changes" : "Add product"}
+          {isPending
+            ? dictionary.common.saving
+            : product
+              ? dictionary.catalog.saveProduct
+              : dictionary.catalog.addProduct}
         </button>
         <Link
           href={ROUTES.OWNER_PRODUCTS}
           className="text-sm font-semibold text-slate-600 hover:text-slate-950"
         >
-          Cancel
+          {dictionary.common.cancel}
         </Link>
       </div>
     </form>
