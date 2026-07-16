@@ -5,3 +5,7 @@ export const ROLES = {
 } as const;
 
 export type Role = (typeof ROLES)[keyof typeof ROLES];
+
+export function isRole(value: unknown): value is Role {
+  return value === ROLES.OWNER || value === ROLES.SELLER || value === ROLES.SERVICE_ADMIN;
+}

@@ -1,13 +1,15 @@
 import Link from "next/link";
+import type { ReactNode } from "react";
 
 type PlaceholderPageProps = {
   eyebrow: string;
   title: string;
   description: string;
   status: string;
+  action?: ReactNode;
 };
 
-export function PlaceholderPage({ eyebrow, title, description, status }: PlaceholderPageProps) {
+export function PlaceholderPage({ eyebrow, title, description, status, action }: PlaceholderPageProps) {
   return (
     <main className="mx-auto flex w-full max-w-6xl flex-1 items-center px-4 py-12 sm:px-6 sm:py-16 lg:px-8">
       <section className="w-full border-y border-slate-200 py-10 sm:py-14">
@@ -18,9 +20,12 @@ export function PlaceholderPage({ eyebrow, title, description, status }: Placeho
 
           <div className="mt-8 flex flex-col gap-4 border-l-4 border-amber-400 bg-amber-50 p-4 sm:flex-row sm:items-center sm:justify-between">
             <p className="text-sm font-medium text-amber-950">{status}</p>
-            <Link href="/" className="text-sm font-semibold text-emerald-700 hover:text-emerald-800">
-              Back to overview
-            </Link>
+            <div className="flex items-center gap-5">
+              <Link href="/" className="text-sm font-semibold text-emerald-700 hover:text-emerald-800">
+                Back to overview
+              </Link>
+              {action}
+            </div>
           </div>
         </div>
       </section>
