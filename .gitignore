@@ -30,6 +30,7 @@ yarn-error.log*
 
 # environment files
 .env*
+!.env.example
 
 # vercel
 .vercel
@@ -41,4 +42,3 @@ next-env.d.ts
 # local Codex workspace metadata
 /.agents/
 /.codex/
-

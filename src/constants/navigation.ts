@@ -1,9 +1,10 @@
 import type { NavigationItem } from "@/types/navigation";
 
-export const navigationItems: NavigationItem[] = [
-  { href: "/", label: "Home" },
-  { href: "/login", label: "Login" },
-  { href: "/owner/dashboard", label: "Owner" },
-  { href: "/seller/pos", label: "Seller POS" },
-];
+import { ROUTES } from "@/constants/routes";
 
+export const navigationItems: NavigationItem[] = [
+  { href: ROUTES.HOME, label: "Home" },
+  { href: ROUTES.LOGIN, label: "Login" },
+  { href: ROUTES.OWNER_DASHBOARD, label: "Owner" },
+  { href: ROUTES.SELLER_POS, label: "Seller POS" },
+];
