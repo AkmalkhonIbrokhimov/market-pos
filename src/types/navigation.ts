@@ -1,5 +1,5 @@
 export type NavigationItem = {
   href: string;
-  label: string;
+  labelKey: "home" | "login" | "owner" | "sellerPos";
 };
 
