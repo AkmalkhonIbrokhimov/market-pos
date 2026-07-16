@@ -54,9 +54,18 @@ export default async function StockIncomePage() {
           </p>
         ) : null}
         {products.length === 0 ? (
-          <p className="mt-6 border-l-4 border-amber-500 bg-amber-50 p-4 text-sm text-amber-900">
-            {dictionary.stock.noProducts}
-          </p>
+          <div className="mt-6 flex flex-col gap-4 border-l-4 border-amber-500 bg-amber-50 p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-sm font-semibold text-amber-950">{dictionary.stock.noProducts}</p>
+              <p className="mt-1 text-sm text-amber-900">{dictionary.stock.productHelper}</p>
+            </div>
+            <Link
+              href={ROUTES.OWNER_NEW_PRODUCT}
+              className="shrink-0 bg-amber-900 px-4 py-2.5 text-center text-sm font-bold text-white hover:bg-amber-950"
+            >
+              {dictionary.stock.addProduct}
+            </Link>
+          </div>
         ) : null}
 
         <div className="mt-6">

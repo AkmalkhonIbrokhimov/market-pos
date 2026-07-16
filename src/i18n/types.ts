@@ -157,6 +157,17 @@ export type Dictionary = {
     noSupplier: string;
     noStores: string;
     noProducts: string;
+    addProduct: string;
+    missingProductLink: string;
+    productHelper: string;
+    productSearch: string;
+    noProductMatches: string;
+    supplierMode: string;
+    supplierHelper: string;
+    supplierNone: string;
+    supplierExisting: string;
+    supplierNew: string;
+    newSupplier: string;
     errors: {
       noOrganization: string;
       storeRequired: string;
