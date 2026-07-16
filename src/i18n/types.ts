@@ -1,0 +1,136 @@
+export type Locale = "ru" | "en" | "uz-Latn" | "uz-Cyrl";
+
+export type Dictionary = {
+  navigation: {
+    home: string;
+    login: string;
+    owner: string;
+    sellerPos: string;
+    products: string;
+    categories: string;
+    logout: string;
+    mainAria: string;
+    ownerAria: string;
+  };
+  common: {
+    language: string;
+    active: string;
+    inactive: string;
+    status: string;
+    name: string;
+    category: string;
+    barcode: string;
+    unit: string;
+    salePrice: string;
+    currentQuantity: string;
+    minimumQuantity: string;
+    action: string;
+    save: string;
+    add: string;
+    edit: string;
+    search: string;
+    back: string;
+    cancel: string;
+    saving: string;
+    adding: string;
+    backToOverview: string;
+    noCategory: string;
+    required: string;
+    loading: string;
+  };
+  home: {
+    eyebrow: string;
+    title: string;
+    description: string;
+    mvpTitle: string;
+    mvpDescription: string;
+    modesEyebrow: string;
+    modesTitle: string;
+    openLogin: string;
+    ownerTitle: string;
+    ownerDescription: string;
+    sellerTitle: string;
+    sellerDescription: string;
+    viewWorkspace: string;
+  };
+  auth: {
+    eyebrow: string;
+    title: string;
+    description: string;
+    formTitle: string;
+    email: string;
+    password: string;
+    emailPlaceholder: string;
+    signIn: string;
+    signingIn: string;
+    errors: {
+      requiredCredentials: string;
+      invalidCredentials: string;
+      emailNotConfirmed: string;
+      genericSignIn: string;
+      profileLoad: string;
+      missingProfile: string;
+      blocked: string;
+      inactive: string;
+      unsupportedRole: string;
+    };
+  };
+  owner: {
+    eyebrow: string;
+    dashboard: string;
+    description: string;
+    placeholderStatus: string;
+    manageProducts: string;
+  };
+  seller: {
+    eyebrow: string;
+    title: string;
+    description: string;
+    placeholderStatus: string;
+  };
+  catalog: {
+    eyebrow: string;
+    products: string;
+    productsDescription: string;
+    categories: string;
+    categoriesDescription: string;
+    searchProducts: string;
+    addProduct: string;
+    product: string;
+    noProducts: string;
+    noSearchResults: string;
+    uncategorized: string;
+    noOrganization: string;
+    addProductTitle: string;
+    addProductDescription: string;
+    editProductTitle: string;
+    editProductDescription: string;
+    productName: string;
+    expirable: string;
+    quantityNote: string;
+    saveProduct: string;
+    addCategory: string;
+    noCategories: string;
+    errors: {
+      categoryNameRequired: string;
+      invalidCategoryStatus: string;
+      duplicateCategory: string;
+      categorySave: string;
+      productNameRequired: string;
+      salePriceInvalid: string;
+      minimumQuantityInvalid: string;
+      invalidProductStatus: string;
+      invalidCategory: string;
+      missingProduct: string;
+      duplicateBarcode: string;
+      productCreate: string;
+      productUpdate: string;
+      productNotFound: string;
+    };
+  };
+  roles: {
+    owner: string;
+    seller: string;
+    serviceAdmin: string;
+  };
+};

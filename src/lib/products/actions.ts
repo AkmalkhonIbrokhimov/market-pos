@@ -6,6 +6,8 @@ import { redirect } from "next/navigation";
 import { ROUTES, getOwnerProductEditRoute } from "@/constants/routes";
 import { requireOwnerManager } from "@/lib/auth/guards";
 import { createClient } from "@/lib/supabase/server";
+import { getDictionary } from "@/i18n/server";
+import type { Dictionary } from "@/i18n/types";
 import type { CatalogActionState, CatalogStatus } from "@/types/catalog";
 
 const VALID_STATUSES: CatalogStatus[] = ["active", "inactive"];
@@ -30,7 +32,7 @@ function parseNonNegativeNumber(value: FormDataEntryValue | null): number | null
     : null;
 }
 
-function parseProductInput(formData: FormData): ProductInput | CatalogActionState {
+function parseProductInput(formData: FormData, dictionary: Dictionary): ProductInput | CatalogActionState {
   const name = String(formData.get("name") ?? "").trim();
   const barcode = String(formData.get("barcode") ?? "").trim() || null;
   const unit = String(formData.get("unit") ?? "").trim() || "шт";
@@ -40,19 +42,19 @@ function parseProductInput(formData: FormData): ProductInput | CatalogActionStat
   const status = String(formData.get("status") ?? "active") as CatalogStatus;
 
   if (!name) {
-    return { error: "Product name is required." };
+    return { error: dictionary.catalog.errors.productNameRequired };
   }
 
   if (salePrice === null) {
-    return { error: "Sale price is required and must be zero or greater." };
+    return { error: dictionary.catalog.errors.salePriceInvalid };
   }
 
   if (minQuantity === null) {
-    return { error: "Minimum quantity must be zero or greater." };
+    return { error: dictionary.catalog.errors.minimumQuantityInvalid };
   }
 
   if (!VALID_STATUSES.includes(status)) {
-    return { error: "Choose a valid product status." };
+    return { error: dictionary.catalog.errors.invalidProductStatus };
   }
 
   return {
@@ -105,11 +107,12 @@ export async function createProduct(
   formData: FormData,
 ): Promise<CatalogActionState> {
   const currentUser = await requireOwnerManager();
+  const dictionary = await getDictionary();
   const organizationId = currentUser.profile.organizationId;
-  const input = parseProductInput(formData);
+  const input = parseProductInput(formData, dictionary);
 
   if (!organizationId) {
-    return { error: "Your user profile is not assigned to an organization." };
+    return { error: dictionary.catalog.noOrganization };
   }
 
   if ("error" in input) {
@@ -117,7 +120,7 @@ export async function createProduct(
   }
 
   if (!(await validateCategory(organizationId, input.categoryId))) {
-    return { error: "Choose a category from your organization." };
+    return { error: dictionary.catalog.errors.invalidCategory };
   }
 
   const supabase = await createClient();
@@ -126,11 +129,11 @@ export async function createProduct(
     .insert(toProductPayload(organizationId, input));
 
   if (error?.code === "23505") {
-    return { error: "A product with this barcode already exists." };
+    return { error: dictionary.catalog.errors.duplicateBarcode };
   }
 
   if (error) {
-    return { error: "Unable to add the product. Please try again." };
+    return { error: dictionary.catalog.errors.productCreate };
   }
 
   revalidatePath(ROUTES.OWNER_PRODUCTS);
@@ -142,16 +145,17 @@ export async function updateProduct(
   formData: FormData,
 ): Promise<CatalogActionState> {
   const currentUser = await requireOwnerManager();
+  const dictionary = await getDictionary();
   const organizationId = currentUser.profile.organizationId;
   const productId = String(formData.get("product_id") ?? "").trim();
-  const input = parseProductInput(formData);
+  const input = parseProductInput(formData, dictionary);
 
   if (!organizationId) {
-    return { error: "Your user profile is not assigned to an organization." };
+    return { error: dictionary.catalog.noOrganization };
   }
 
   if (!productId) {
-    return { error: "The product could not be identified." };
+    return { error: dictionary.catalog.errors.missingProduct };
   }
 
   if ("error" in input) {
@@ -159,7 +163,7 @@ export async function updateProduct(
   }
 
   if (!(await validateCategory(organizationId, input.categoryId))) {
-    return { error: "Choose a category from your organization." };
+    return { error: dictionary.catalog.errors.invalidCategory };
   }
 
   const supabase = await createClient();
@@ -172,15 +176,15 @@ export async function updateProduct(
     .maybeSingle();
 
   if (error?.code === "23505") {
-    return { error: "A product with this barcode already exists." };
+    return { error: dictionary.catalog.errors.duplicateBarcode };
   }
 
   if (error) {
-    return { error: "Unable to update the product. Please try again." };
+    return { error: dictionary.catalog.errors.productUpdate };
   }
 
   if (!data) {
-    return { error: "Product not found or access was denied." };
+    return { error: dictionary.catalog.errors.productNotFound };
   }
 
   revalidatePath(ROUTES.OWNER_PRODUCTS);

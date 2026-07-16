@@ -3,19 +3,20 @@
 import { useActionState } from "react";
 
 import { createCategory } from "@/lib/categories/actions";
+import type { Dictionary } from "@/i18n/types";
 import type { CatalogActionState } from "@/types/catalog";
 
 const INITIAL_STATE: CatalogActionState = { error: null };
 
-export function CategoryForm() {
+export function CategoryForm({ dictionary }: { dictionary: Dictionary }) {
   const [state, formAction, isPending] = useActionState(createCategory, INITIAL_STATE);
 
   return (
     <form action={formAction} className="border border-slate-200 bg-white p-5">
-      <h2 className="text-lg font-bold text-slate-950">Add category</h2>
+      <h2 className="text-lg font-bold text-slate-950">{dictionary.catalog.addCategory}</h2>
       <div className="mt-5 grid gap-4 sm:grid-cols-[minmax(0,1fr)_11rem_auto] sm:items-end">
         <label className="block text-sm font-semibold text-slate-700">
-          Name
+          {dictionary.common.name}
           <input
             required
             name="name"
@@ -24,14 +25,14 @@ export function CategoryForm() {
           />
         </label>
         <label className="block text-sm font-semibold text-slate-700">
-          Status
+          {dictionary.common.status}
           <select
             name="status"
             defaultValue="active"
             className="mt-2 block w-full border border-slate-300 bg-white px-3 py-2.5 font-normal text-slate-950 outline-none focus:border-emerald-600 focus:ring-2 focus:ring-emerald-100"
           >
-            <option value="active">Active</option>
-            <option value="inactive">Inactive</option>
+            <option value="active">{dictionary.common.active}</option>
+            <option value="inactive">{dictionary.common.inactive}</option>
           </select>
         </label>
         <button
@@ -39,7 +40,7 @@ export function CategoryForm() {
           disabled={isPending}
           className="min-h-11 bg-emerald-700 px-5 py-2.5 text-sm font-bold text-white hover:bg-emerald-800 disabled:cursor-not-allowed disabled:opacity-60"
         >
-          {isPending ? "Adding..." : "Add category"}
+          {isPending ? dictionary.common.adding : dictionary.catalog.addCategory}
         </button>
       </div>
       {state.error ? (

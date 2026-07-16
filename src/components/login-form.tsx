@@ -4,11 +4,12 @@ import { useActionState } from "react";
 import { useFormStatus } from "react-dom";
 
 import { login } from "@/lib/auth/actions";
+import type { Dictionary } from "@/i18n/types";
 import type { LoginActionState } from "@/types/auth";
 
 const initialState: LoginActionState = { error: null };
 
-function SubmitButton() {
+function SubmitButton({ dictionary }: { dictionary: Dictionary["auth"] }) {
   const { pending } = useFormStatus();
 
   return (
@@ -17,19 +18,19 @@ function SubmitButton() {
       disabled={pending}
       className="h-11 w-full rounded-lg bg-emerald-700 px-4 text-sm font-semibold text-white transition-colors hover:bg-emerald-800 disabled:cursor-not-allowed disabled:bg-slate-400"
     >
-      {pending ? "Signing in..." : "Sign in"}
+      {pending ? dictionary.signingIn : dictionary.signIn}
     </button>
   );
 }
 
-export function LoginForm() {
+export function LoginForm({ dictionary }: { dictionary: Dictionary["auth"] }) {
   const [state, formAction] = useActionState(login, initialState);
 
   return (
     <form action={formAction} className="mt-8 space-y-5">
       <div>
         <label htmlFor="email" className="block text-sm font-semibold text-slate-800">
-          Email
+          {dictionary.email}
         </label>
         <input
           id="email"
@@ -38,13 +39,13 @@ export function LoginForm() {
           autoComplete="email"
           required
           className="mt-2 h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-base text-slate-950 outline-none transition-colors placeholder:text-slate-400 focus:border-emerald-600 focus:ring-2 focus:ring-emerald-100"
-          placeholder="you@example.com"
+          placeholder={dictionary.emailPlaceholder}
         />
       </div>
 
       <div>
         <label htmlFor="password" className="block text-sm font-semibold text-slate-800">
-          Password
+          {dictionary.password}
         </label>
         <input
           id="password"
@@ -62,7 +63,7 @@ export function LoginForm() {
         </p>
       ) : null}
 
-      <SubmitButton />
+      <SubmitButton dictionary={dictionary} />
     </form>
   );
 }

@@ -6,10 +6,11 @@ type PlaceholderPageProps = {
   title: string;
   description: string;
   status: string;
+  backLabel: string;
   action?: ReactNode;
 };
 
-export function PlaceholderPage({ eyebrow, title, description, status, action }: PlaceholderPageProps) {
+export function PlaceholderPage({ eyebrow, title, description, status, backLabel, action }: PlaceholderPageProps) {
   return (
     <main className="mx-auto flex w-full max-w-6xl flex-1 items-center px-4 py-12 sm:px-6 sm:py-16 lg:px-8">
       <section className="w-full border-y border-slate-200 py-10 sm:py-14">
@@ -22,7 +23,7 @@ export function PlaceholderPage({ eyebrow, title, description, status, action }:
             <p className="text-sm font-medium text-amber-950">{status}</p>
             <div className="flex items-center gap-5">
               <Link href="/" className="text-sm font-semibold text-emerald-700 hover:text-emerald-800">
-                Back to overview
+                {backLabel}
               </Link>
               {action}
             </div>
