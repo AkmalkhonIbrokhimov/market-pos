@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 import { redirect } from "next/navigation";
 
 import { LogoutButton } from "@/components/logout-button";
@@ -27,7 +28,17 @@ export default async function OwnerDashboardPage() {
       title="Dashboard"
       description="This area will give shop owners a clear view of inventory, sales, debts, shifts, and business performance."
       status="Sprint 1 route placeholder — dashboard data is not connected yet."
-      action={<LogoutButton />}
+      action={
+        <>
+          <Link
+            href={ROUTES.OWNER_PRODUCTS}
+            className="text-sm font-semibold text-emerald-700 hover:text-emerald-800"
+          >
+            Manage products
+          </Link>
+          <LogoutButton />
+        </>
+      }
     />
   );
 }
