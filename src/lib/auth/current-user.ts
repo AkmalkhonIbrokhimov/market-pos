@@ -9,6 +9,7 @@ export type CurrentUser = {
     id: string;
     fullName: string;
     email: string | null;
+    organizationId: string | null;
     role: Role;
   };
 };
@@ -26,7 +27,7 @@ export async function getCurrentUser(): Promise<CurrentUser | null> {
 
   const { data: profile, error: profileError } = await supabase
     .from("users")
-    .select("id, full_name, email, role, status")
+    .select("id, full_name, email, organization_id, role, status")
     .eq("auth_user_id", authUser.id)
     .maybeSingle();
 
@@ -40,6 +41,7 @@ export async function getCurrentUser(): Promise<CurrentUser | null> {
       id: profile.id,
       fullName: profile.full_name,
       email: profile.email,
+      organizationId: profile.organization_id,
       role: profile.role,
     },
   };
