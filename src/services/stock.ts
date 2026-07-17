@@ -50,6 +50,8 @@ export async function listStockProducts(organizationId: string): Promise<StockPr
     .select("id, name, barcode, unit, sale_price, current_quantity")
     .eq("organization_id", organizationId)
     .eq("status", "active")
+    .is("archived_at", null)
+    .is("deleted_at", null)
     .order("name");
 
   if (error) {

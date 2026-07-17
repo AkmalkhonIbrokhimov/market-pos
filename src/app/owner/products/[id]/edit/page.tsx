@@ -6,7 +6,10 @@ import { ProductForm } from "@/components/product-form";
 import { requireOwnerManager } from "@/lib/auth/guards";
 import { getDictionary } from "@/i18n/server";
 import { listCategoryOptions } from "@/services/categories";
+import { listBrands } from "@/services/brands";
+import { listProductTypes } from "@/services/product-types";
 import { getProduct } from "@/services/products";
+import { listUnits } from "@/services/units";
 
 export const metadata: Metadata = { title: "Edit product" };
 export const dynamic = "force-dynamic";
@@ -24,9 +27,12 @@ export default async function EditProductPage({ params }: EditProductPageProps) 
     notFound();
   }
 
-  const [product, categories] = await Promise.all([
+  const [product, categories, brands, units, productTypes] = await Promise.all([
     getProduct(organizationId, id),
     listCategoryOptions(organizationId, { includeInactive: true, includeArchived: true }),
+    listBrands(organizationId),
+    listUnits(organizationId),
+    listProductTypes(organizationId),
   ]);
 
   if (!product) {
@@ -45,7 +51,7 @@ export default async function EditProductPage({ params }: EditProductPageProps) 
           </p>
         </div>
         <div className="mt-6">
-          <ProductForm categories={categories} dictionary={dictionary} product={product} />
+          <ProductForm categories={categories} brands={brands} units={units} productTypes={productTypes} dictionary={dictionary} product={product} />
         </div>
       </main>
     </div>
