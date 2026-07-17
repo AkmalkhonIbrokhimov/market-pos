@@ -5,6 +5,9 @@ import { ProductForm } from "@/components/product-form";
 import { requireOwnerManager } from "@/lib/auth/guards";
 import { getDictionary } from "@/i18n/server";
 import { listCategoryOptions } from "@/services/categories";
+import { listBrands } from "@/services/brands";
+import { listProductTypes } from "@/services/product-types";
+import { listUnits } from "@/services/units";
 
 export const metadata: Metadata = { title: "Add product" };
 export const dynamic = "force-dynamic";
@@ -12,7 +15,14 @@ export const dynamic = "force-dynamic";
 export default async function NewProductPage() {
   const [currentUser, dictionary] = await Promise.all([requireOwnerManager(), getDictionary()]);
   const organizationId = currentUser.profile.organizationId;
-  const categories = organizationId ? await listCategoryOptions(organizationId) : [];
+  const [categories, brands, units, productTypes] = organizationId
+    ? await Promise.all([
+        listCategoryOptions(organizationId),
+        listBrands(organizationId, false),
+        listUnits(organizationId, false),
+        listProductTypes(organizationId, false),
+      ])
+    : [[], [], [], []];
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -24,7 +34,7 @@ export default async function NewProductPage() {
           <p className="mt-2 text-sm text-slate-600">{dictionary.catalog.addProductDescription}</p>
         </div>
         <div className="mt-6">
-          <ProductForm categories={categories} dictionary={dictionary} />
+          <ProductForm categories={categories} brands={brands} units={units} productTypes={productTypes} dictionary={dictionary} />
         </div>
       </main>
     </div>

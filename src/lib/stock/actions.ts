@@ -149,6 +149,8 @@ export async function addStockIncome(
       .eq("id", input.productId)
       .eq("organization_id", organizationId)
       .eq("status", "active")
+      .is("archived_at", null)
+      .is("deleted_at", null)
       .maybeSingle(),
   ]);
 

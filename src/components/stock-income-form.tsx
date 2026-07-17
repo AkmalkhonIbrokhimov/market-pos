@@ -16,6 +16,7 @@ type StockIncomeFormProps = {
   products: StockProduct[];
   stores: StockStore[];
   suppliers: Supplier[];
+  defaultProductId?: string;
 };
 
 function formatNumber(value: number, locale: Locale, maximumFractionDigits = 3): string {
@@ -28,6 +29,7 @@ export function StockIncomeForm({
   products,
   stores,
   suppliers,
+  defaultProductId,
 }: StockIncomeFormProps) {
   const [state, formAction, isPending] = useActionState(addStockIncome, INITIAL_STATE);
   const canSubmit = stores.length > 0 && products.length > 0;
@@ -59,7 +61,7 @@ export function StockIncomeForm({
           <select
             required
             name="product_id"
-            defaultValue=""
+            defaultValue={defaultProductId ?? ""}
             className="mt-2 block w-full border border-slate-300 bg-white px-3 py-2.5 font-normal text-slate-950 outline-none focus:border-emerald-600 focus:ring-2 focus:ring-emerald-100"
           >
             <option value="" disabled>

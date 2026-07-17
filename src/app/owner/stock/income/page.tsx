@@ -12,7 +12,7 @@ import { listSuppliers } from "@/services/suppliers";
 export const metadata: Metadata = { title: "Stock income" };
 export const dynamic = "force-dynamic";
 
-export default async function StockIncomePage() {
+export default async function StockIncomePage({ searchParams }: { searchParams: Promise<{ product_id?: string }> }) {
   const [currentUser, dictionary, locale] = await Promise.all([
     requireOwnerManager(),
     getDictionary(),
@@ -24,6 +24,8 @@ export default async function StockIncomePage() {
     organizationId ? listStockProducts(organizationId) : Promise.resolve([]),
     organizationId ? listSuppliers(organizationId) : Promise.resolve([]),
   ]);
+  const { product_id: requestedProductId } = await searchParams;
+  const defaultProductId = products.some((product) => product.id === requestedProductId) ? requestedProductId : undefined;
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -66,6 +68,7 @@ export default async function StockIncomePage() {
             products={products}
             stores={stores}
             suppliers={suppliers}
+            defaultProductId={defaultProductId}
           />
         </div>
       </main>
