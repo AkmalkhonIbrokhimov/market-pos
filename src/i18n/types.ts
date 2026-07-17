@@ -176,6 +176,42 @@ export type Dictionary = {
       movementCreatePartial: string;
     };
   };
+  roadmap: {
+    catalog: string;
+    stock: string;
+    pricing: string;
+    plannedModule: string;
+    backToCatalog: string;
+    backToStock: string;
+    backToPricing: string;
+    openModule: string;
+    overviewTitle: string;
+    overviewDescription: string;
+    cards: {
+      catalog: { title: string; description: string };
+      stock: { title: string; description: string };
+      pricing: { title: string; description: string };
+      suppliers: { title: string; description: string };
+      reports: { title: string; description: string };
+    };
+    modules: {
+      brands: { title: string; description: string };
+      units: { title: string; description: string };
+      productTypes: { title: string; description: string };
+      productArchive: { title: string; description: string };
+      importExcel: { title: string; description: string };
+      exportExcel: { title: string; description: string };
+      printPriceTags: { title: string; description: string };
+      printBarcodes: { title: string; description: string };
+      invoices: { title: string; description: string };
+      suppliers: { title: string; description: string };
+      recommendedOrder: { title: string; description: string };
+      expirationControl: { title: string; description: string };
+      stockMovements: { title: string; description: string };
+      priceCalculator: { title: string; description: string };
+      priceHistory: { title: string; description: string };
+    };
+  };
   roles: {
     owner: string;
     seller: string;
