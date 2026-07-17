@@ -4,7 +4,7 @@ import { OwnerHeader } from "@/components/owner-header";
 import { ProductForm } from "@/components/product-form";
 import { requireOwnerManager } from "@/lib/auth/guards";
 import { getDictionary } from "@/i18n/server";
-import { listCategories } from "@/services/categories";
+import { listCategoryOptions } from "@/services/categories";
 
 export const metadata: Metadata = { title: "Add product" };
 export const dynamic = "force-dynamic";
@@ -12,7 +12,7 @@ export const dynamic = "force-dynamic";
 export default async function NewProductPage() {
   const [currentUser, dictionary] = await Promise.all([requireOwnerManager(), getDictionary()]);
   const organizationId = currentUser.profile.organizationId;
-  const categories = organizationId ? await listCategories(organizationId) : [];
+  const categories = organizationId ? await listCategoryOptions(organizationId) : [];
 
   return (
     <div className="min-h-screen bg-slate-50">
