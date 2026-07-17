@@ -30,3 +30,11 @@ export type AppRoute = (typeof ROUTES)[keyof typeof ROUTES];
 export function getOwnerProductEditRoute(id: string): string {
   return `/owner/products/${id}/edit`;
 }
+
+export function getOwnerCategoryEditRoute(id: string): string {
+  return `/owner/categories/${id}/edit`;
+}
+
+export function getOwnerAddSubcategoryRoute(parentId: string): string {
+  return `${ROUTES.OWNER_CATEGORIES}?parent_id=${encodeURIComponent(parentId)}#category-form`;
+}

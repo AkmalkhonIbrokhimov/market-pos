@@ -6,12 +6,12 @@ import { useActionState } from "react";
 import { ROUTES } from "@/constants/routes";
 import type { Dictionary } from "@/i18n/types";
 import { createProduct, updateProduct } from "@/lib/products/actions";
-import type { CatalogActionState, Category, ProductFormValue } from "@/types/catalog";
+import type { CatalogActionState, CategoryOption, ProductFormValue } from "@/types/catalog";
 
 const INITIAL_STATE: CatalogActionState = { error: null };
 
 type ProductFormProps = {
-  categories: Category[];
+  categories: CategoryOption[];
   dictionary: Dictionary;
   product?: ProductFormValue;
 };
@@ -45,8 +45,17 @@ export function ProductForm({ categories, dictionary, product }: ProductFormProp
           >
             <option value="">{dictionary.common.noCategory}</option>
             {categories.map((category) => (
-              <option key={category.id} value={category.id}>
-                {category.name}
+              <option
+                key={category.id}
+                value={category.id}
+                disabled={
+                  category.id !== product?.categoryId &&
+                  (category.status !== "active" || Boolean(category.archivedAt))
+                }
+              >
+                {`${"— ".repeat(category.depth)}${category.name}${
+                  category.archivedAt ? ` (${dictionary.catalog.archived})` : ""
+                }`}
               </option>
             ))}
           </select>
