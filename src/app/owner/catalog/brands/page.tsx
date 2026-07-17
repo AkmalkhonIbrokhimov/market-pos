@@ -1,5 +1,5 @@
-import { OwnerRoadmapPage } from "@/components/owner-roadmap-page";
+import { CatalogReferencePage } from "@/components/catalog-reference-page";
 
 export default function BrandsPage() {
-  return <OwnerRoadmapPage area="catalog" moduleKey="brands" />;
+  return <CatalogReferencePage kind="brand" />;
 }

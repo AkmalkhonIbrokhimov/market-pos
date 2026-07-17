@@ -1,5 +1,5 @@
-import { OwnerRoadmapPage } from "@/components/owner-roadmap-page";
+import { CatalogReferencePage } from "@/components/catalog-reference-page";
 
 export default function UnitsPage() {
-  return <OwnerRoadmapPage area="catalog" moduleKey="units" />;
+  return <CatalogReferencePage kind="unit" />;
 }

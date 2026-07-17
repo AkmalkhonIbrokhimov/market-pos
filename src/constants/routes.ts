@@ -31,6 +31,14 @@ export function getOwnerProductEditRoute(id: string): string {
   return `/owner/products/${id}/edit`;
 }
 
+export function getOwnerProductRoute(id: string): string {
+  return `/owner/products/${id}`;
+}
+
+export function getOwnerProductStockIncomeRoute(id: string): string {
+  return `${ROUTES.OWNER_STOCK_INCOME}?product_id=${encodeURIComponent(id)}`;
+}
+
 export function getOwnerCategoryEditRoute(id: string): string {
   return `/owner/categories/${id}/edit`;
 }
