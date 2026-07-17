@@ -5,7 +5,7 @@ import { OwnerHeader } from "@/components/owner-header";
 import { ProductForm } from "@/components/product-form";
 import { requireOwnerManager } from "@/lib/auth/guards";
 import { getDictionary } from "@/i18n/server";
-import { listCategories } from "@/services/categories";
+import { listCategoryOptions } from "@/services/categories";
 import { getProduct } from "@/services/products";
 
 export const metadata: Metadata = { title: "Edit product" };
@@ -26,7 +26,7 @@ export default async function EditProductPage({ params }: EditProductPageProps) 
 
   const [product, categories] = await Promise.all([
     getProduct(organizationId, id),
-    listCategories(organizationId),
+    listCategoryOptions(organizationId, { includeInactive: true, includeArchived: true }),
   ]);
 
   if (!product) {
