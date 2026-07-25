@@ -1,0 +1,2114 @@
+# Market POS V2 — проектирование базы данных
+
+**Статус:** Proposed
+
+**Версия:** 2.0
+
+**Дата:** 25 июля 2026 года
+
+**Источники:** [PRODUCT_SPEC_V2.md](./PRODUCT_SPEC_V2.md), [ARCHITECTURE_V2.md](./ARCHITECTURE_V2.md)
+
+Документ проектирует целевую PostgreSQL-модель до написания новых migrations. Имена, типы, ограничения и транзакционные контракты ниже являются входом для будущих миграций `0007`–`0020`; существующие migrations не изменяются.
+
+## 1. Назначение документа
+
+Цель — дать реализуемую модель данных для Core Pilot Market POS V2: таблицы, владение, RLS, ledgers, projections, транзакционные команды, перенос V1 и проверки целостности.
+
+## 2. Область проектирования
+
+В область входят identity/access, organization structure, catalog, pricing, counterparties, purchases, inventory, sales, payments, debts, settlements, shifts, fiscal records, offline sync, audit, notifications и report projections.
+
+Не входят SQL-реализация, выбор конкретного fiscal provider, бухгалтерский план счетов и удаление legacy-таблиц.
+
+```mermaid
+erDiagram
+  ORGANIZATIONS ||--o{ ORGANIZATION_MEMBERSHIPS : has
+  ORGANIZATIONS ||--o{ BRANCHES : owns
+  BRANCHES ||--o{ WAREHOUSES : contains
+  BRANCHES ||--o{ REGISTERS : contains
+  REGISTERS ||--o{ DEVICES : uses
+  ORGANIZATIONS ||--o{ PRODUCTS : catalogs
+  PRODUCTS ||--o{ PRODUCT_BARCODES : identifies
+  PRODUCTS ||--o{ PRODUCT_PRICES : prices
+  ORGANIZATIONS ||--o{ COUNTERPARTIES : works_with
+  COUNTERPARTIES ||--o{ PURCHASE_DOCUMENTS : supplies
+  PURCHASE_DOCUMENTS ||--|{ PURCHASE_LINES : contains
+  PURCHASE_LINES ||--o{ PRODUCT_BATCHES : creates
+  WAREHOUSES ||--o{ INVENTORY_MOVEMENTS : records
+  REGISTERS ||--o{ SHIFTS : opens
+  SHIFTS ||--o{ SALES : groups
+  SALES ||--|{ SALE_LINES : contains
+  SALES ||--o{ PAYMENTS : receives
+  SALES ||--o| RECEIVABLES : creates
+  RECEIVABLES ||--o{ DEBT_ALLOCATIONS : receives
+  COUNTERPARTIES ||--o{ SETTLEMENT_ENTRIES : has
+  DEVICES ||--o{ SYNC_COMMANDS : submits
+  ORGANIZATIONS ||--o{ AUDIT_EVENTS : records
+```
+
+## 3. Принципы модели данных
+
+- PostgreSQL — серверный источник истины; IndexedDB — локальная реплика и очередь.
+- Документы порождают append-only проводки; карточки не меняют остатки и деньги.
+- Ledger и projection разделены, projection всегда пересчитывается.
+- Tenant-owned запись имеет `organization_id` либо достижимую неизменяемую связь с tenant root.
+- Проведённые документы не удаляются и не переписываются; исправление — reversal.
+- Одна команда фиксирует документ, проводки, audit и outbox одной транзакцией.
+- Browser пишет только безопасные drafts/reference data; posting доступен через functions/RPC.
+- Новые lifecycle-статусы используют `text + check`, если набор не является стабильным межмодульным типом.
+
+**Общие типы:** деньги `numeric(18,4)`, количество `numeric(18,6)`, будущий курс `numeric(20,10)`, валюта `char(3)`, метки времени `timestamptz`, business date `date`, payload `jsonb`.
+
+## 4. Соглашения по именованию
+
+- таблицы и поля: `snake_case`, таблицы во множественном числе;
+- PK: `id`; FK: `<entity>_id`;
+- timestamps: `created_at`, `updated_at`, `posted_at`, `reversed_at`, `archived_at`;
+- check: `<table>_<rule>_check`;
+- unique: `<table>_<scope>_key`;
+- index: `<table>_<query>_idx`;
+- RLS policy: `<table>_<operation>_<scope>`;
+- functions: глагол + объект, например `post_sale`;
+- суммы оканчиваются на `_amount`, цены на `_price`, количества на `_quantity`;
+- status — lowercase stable code, переводится только в UI.
+
+## 5. Соглашения по UUID
+
+Все business entities используют `uuid primary key default gen_random_uuid()`. Offline-клиент заранее генерирует UUID для документа и `local_operation_id`. Сервер не доверяет клиентскому UUID как доказательству tenant или прав.
+
+Для идемпотентности уникален `(organization_id, device_id, local_operation_id)`. UUID не переиспользуется после reversal или archive.
+
+## 6. Денежные значения
+
+Все финансовые поля — `numeric(18,4)` и имеют `currency_code char(3)`. Между PostgreSQL и TypeScript передаются decimal strings.
+
+Округление:
+
+- строка документа — после quantity × unit price с точностью валюты;
+- скидка и налог — по строке, остаток распределяется детерминированно;
+- итог — сумма уже округлённых строк и расходов;
+- purchase cost allocation — пропорционально выбранной базе, остаток последней строке;
+- settlement — только после суммирования ledger;
+- reports — агрегируют сохранённые суммы, не пересчитывают документы;
+- Core Pilot использует `UZS`, но не hardcodes валюту в таблицах.
+
+## 7. Количества и единицы измерения
+
+Количество — `numeric(18,6)`. Документ хранит введённые unit/quantity, коэффициент и `base_quantity`. `unit_conversions.factor` строго больше нуля. Остаток ведётся только в базовой единице товара.
+
+## 8. Даты, время и business date
+
+События хранятся в UTC как `timestamptz`. `business_date` вычисляется сервером по IANA timezone филиала. Client time хранится отдельно и не определяет порядок проводок. Срок годности — `date`; периоды — полуинтервалы `[starts_at, ends_at)`.
+
+## 9. Организации и tenant isolation
+
+### `organizations`
+
+**Контракт:** модуль Organizations; tenant root. PK `id`; unique `slug`; RLS — active membership, support только по grant; insert platform onboarding, update owner/service command; delete запрещён, archive через `status/archived_at`; создаётся `create_organization`; outbox `OrganizationCreated/Archived`; offline read-only snapshot.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Организация |
+| name | text | нет | — | Название |
+| slug | text | нет | — | Стабильный tenant key |
+| status | text | нет | `'active'` | `active`, `blocked`, `archived` |
+| created_at | timestamptz | нет | now() | Создание |
+| updated_at | timestamptz | нет | now() | Изменение |
+| archived_at | timestamptz | да | — | Архивирование |
+
+Checks: непустые `name/slug`, допустимый status. Индексы: unique lower(slug), `(status)`. FK отсутствуют. Прямой authenticated insert/delete запрещён.
+
+### `organization_settings`
+
+**Контракт:** Organizations; настройки 1:1. PK/FK `organization_id → organizations restrict`; RLS как organization; upsert owner с permission; delete запрещён; источник `create_organization/update_organization_settings`; outbox `OrganizationSettingsChanged`; offline синхронизируются locale/timezone/currency и лимиты.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| organization_id | uuid | нет | — | PK и владелец |
+| currency_code | char(3) | нет | `'UZS'` | Основная валюта |
+| timezone | text | нет | `'Asia/Tashkent'` | IANA timezone |
+| default_locale | text | нет | `'ru'` | Локаль |
+| price_rounding_scale | smallint | нет | `0` | Знаки цены |
+| max_offline_hours | integer | нет | `24` | Offline grant |
+| settings | jsonb | нет | `'{}'` | Некритичные расширения |
+| updated_at | timestamptz | нет | now() | Изменение |
+
+Checks: ISO currency, locale из четырёх поддерживаемых, scales/hours в допустимом диапазоне. Индекс не нужен сверх PK.
+
+## 10. Пользователи и профили
+
+### `user_profiles`
+
+**Контракт:** Identity and Access; профиль Supabase identity. PK `id`, unique `auth_user_id`; FK `auth_user_id → auth.users restrict`; RLS self/authorized management/support grant; update self только безопасные поля, status — admin command; delete запрещён, deactivation через status; источник onboarding/invite; outbox `UserProfileCreated/UserStatusChanged`; offline минимальный actor snapshot.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Profile id |
+| auth_user_id | uuid | нет | — | Supabase Auth id |
+| full_name | text | нет | — | Имя |
+| phone | text | да | — | Телефон |
+| email_snapshot | text | да | — | Отображаемый email |
+| status | text | нет | `'active'` | `invited`, `active`, `blocked`, `inactive` |
+| preferred_locale | text | нет | `'ru'` | Язык |
+| created_at | timestamptz | нет | now() | Создание |
+| updated_at | timestamptz | нет | now() | Изменение |
+
+Checks: full name not blank, locale supported, status allowed. Индексы: unique `(auth_user_id)`, optional normalized phone. Пароль и password hash отсутствуют.
+
+## 11. Memberships
+
+### `organization_memberships`
+
+**Контракт:** Identity and Access; связь profile↔organization и системная роль. PK `id`; FK profile/org restrict; unique pair; RLS own membership и organization managers; insert/update command-only; delete запрещён, status inactive; source invite/accept/block; outbox `MembershipCreated/StatusChanged`; offline permission snapshot versioned.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Membership |
+| organization_id | uuid | нет | — | Tenant |
+| user_profile_id | uuid | нет | — | Пользователь |
+| system_role | text | нет | — | `owner`, `seller`, `service_admin` |
+| status | text | нет | `'invited'` | `invited`, `active`, `blocked`, `inactive` |
+| permission_version | bigint | нет | `1` | Версия offline snapshot |
+| invited_by | uuid | да | — | Кто пригласил |
+| joined_at | timestamptz | да | — | Принятие |
+| created_at | timestamptz | нет | now() | Создание |
+| updated_at | timestamptz | нет | now() | Изменение |
+
+Unique `(organization_id,user_profile_id)`. Checks role/status. Индексы `(user_profile_id,status)`, `(organization_id,status)`. `service_admin` tenant membership не создаёт скрытый доступ: нужен support grant.
+
+## 12. Роли, permission profiles и permissions
+
+### `permission_profiles`
+
+**Контракт:** Identity and Access; tenant permission bundle. PK `id`; FK organization restrict, null только для system templates; unique active name per tenant; RLS safe select, manage owner; update allowed while not archived; delete запрещён; source permission commands; outbox `PermissionProfileChanged`; offline full assigned profile.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Профиль |
+| organization_id | uuid | да | — | Null для system template |
+| code | text | нет | — | Stable code |
+| name | text | нет | — | Название |
+| description | text | да | — | Описание |
+| is_system | boolean | нет | false | Системный шаблон |
+| archived_at | timestamptz | да | — | Архив |
+| created_at | timestamptz | нет | now() | Создание |
+| updated_at | timestamptz | нет | now() | Изменение |
+
+### `permissions`
+
+**Контракт:** Identity and Access; глобальный справочник capability codes. PK `id`, unique `code`; read authenticated; writes только deployment migration; update/delete runtime запрещены; не tenant-owned; outbox отсутствует; offline читается как часть permission snapshot.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Permission |
+| code | text | нет | — | Например `sales.discount.override` |
+| module | text | нет | — | Владеющий модуль |
+| description | text | нет | — | Семантика |
+| critical | boolean | нет | false | Требует approval |
+
+### `permission_profile_permissions`
+
+**Контракт:** Identity and Access; M:N profile↔permission с лимитами. Composite unique; FK cascade только для непроведённых access configuration; RLS по profile tenant; command-only write; delete разрешён как изменение конфигурации с audit; outbox `PermissionProfileChanged`; offline snapshot.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Связь |
+| permission_profile_id | uuid | нет | — | Профиль |
+| permission_id | uuid | нет | — | Permission |
+| constraints | jsonb | нет | `'{}'` | Лимит скидки, долга и scope |
+| created_at | timestamptz | нет | now() | Назначение |
+
+### `membership_permission_profiles`
+
+**Контракт:** Identity and Access; назначения membership↔profile. Unique pair; RLS own read/owner manage; insert/delete command with audit; update не нужен; outbox `PermissionAssigned/Revoked`; offline version bump membership.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Назначение |
+| membership_id | uuid | нет | — | Membership |
+| permission_profile_id | uuid | нет | — | Профиль |
+| assigned_by | uuid | нет | — | Actor membership |
+| created_at | timestamptz | нет | now() | Назначение |
+
+Для четырёх таблиц: names/codes nonblank; unique profile `(coalesce(organization_id,nil_uuid),code)` и связи по паре; индексы на все FK. Запрещается назначать tenant profile membership другой организации; это проверяет command и deferred constraint trigger.
+
+```mermaid
+erDiagram
+  AUTH_USERS ||--|| USER_PROFILES : maps
+  USER_PROFILES ||--o{ ORGANIZATION_MEMBERSHIPS : joins
+  ORGANIZATIONS ||--o{ ORGANIZATION_MEMBERSHIPS : has
+  ORGANIZATION_MEMBERSHIPS ||--o{ MEMBERSHIP_PERMISSION_PROFILES : receives
+  PERMISSION_PROFILES ||--o{ MEMBERSHIP_PERMISSION_PROFILES : assigned
+  PERMISSION_PROFILES ||--o{ PERMISSION_PROFILE_PERMISSIONS : includes
+  PERMISSIONS ||--o{ PERMISSION_PROFILE_PERMISSIONS : grants
+  ORGANIZATION_MEMBERSHIPS ||--o{ BRANCH_ACCESS : scoped
+  ORGANIZATION_MEMBERSHIPS ||--o{ APPROVAL_REQUESTS : requests
+  ORGANIZATIONS ||--o{ SUPPORT_ACCESS_GRANTS : permits
+```
+
+## 13. Branch access
+
+### `branch_access`
+
+**Контракт:** Identity and Access; membership scope к branch. Unique pair; FK membership/branch restrict; RLS own read/owner manage; insert/delete commands with audit; update only flags; no archive; outbox `BranchAccessChanged`; offline scope snapshot.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Access |
+| organization_id | uuid | нет | — | Tenant guard |
+| membership_id | uuid | нет | — | Membership |
+| branch_id | uuid | нет | — | Филиал |
+| is_primary | boolean | нет | false | Основной филиал |
+| created_at | timestamptz | нет | now() | Назначение |
+
+Unique `(membership_id,branch_id)` и partial unique primary per membership. Organization всех ссылок обязана совпадать. Индексы `(branch_id,membership_id)`.
+
+## 14. Подтверждение критических действий
+
+### `approval_requests`
+
+**Контракт:** Identity and Access; approval для конкретной команды. PK id; FK tenant/requester/approver restrict; unique `(organization_id,command_id)` для active request; RLS requester, eligible approver, support grant; insert command, approve/reject constrained update; delete запрещён; retention audit policy; source critical commands; outbox `ApprovalRequested/Resolved`; offline запрос может создаваться, подтверждение требует server.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Request |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | да | — | Scope |
+| command_id | uuid | нет | — | Запрашиваемая команда |
+| permission_code | text | нет | — | Требуемое право |
+| requested_by | uuid | нет | — | Membership |
+| status | text | нет | `'pending'` | `pending`, `approved`, `rejected`, `expired` |
+| reason | text | нет | — | Обоснование |
+| payload_hash | text | нет | — | Неизменность команды |
+| approved_by | uuid | да | — | Approver |
+| decided_at | timestamptz | да | — | Решение |
+| expires_at | timestamptz | нет | — | Срок |
+| created_at | timestamptz | нет | now() | Создание |
+
+Checks согласованности status/approver/decided_at. Индексы `(organization_id,status,expires_at)`, `(requested_by,created_at desc)`.
+
+### `support_access_grants`
+
+**Контракт:** Identity and Access; временный явный доступ service admin. PK id; FK organization/admin/approver restrict; RLS owner и указанный service admin; insert/approve/revoke server-only; delete запрещён; retention security policy; source support workflow; outbox `SupportAccessGranted/Revoked`; offline не реплицируется.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Grant |
+| organization_id | uuid | нет | — | Tenant |
+| service_admin_profile_id | uuid | нет | — | Получатель |
+| scopes | text[] | нет | — | Ограниченные права |
+| reason | text | нет | — | Причина |
+| status | text | нет | `'pending'` | `pending`, `active`, `revoked`, `expired` |
+| approved_by_membership_id | uuid | да | — | Owner approver |
+| starts_at | timestamptz | нет | now() | Начало |
+| expires_at | timestamptz | нет | — | Конец |
+| revoked_at | timestamptz | да | — | Отзыв |
+| created_at | timestamptz | нет | now() | Создание |
+
+Checks `expires_at > starts_at`, active requires approver. Индекс `(service_admin_profile_id,status,expires_at)`.
+
+## 15. Филиалы
+
+### `branches`
+
+**Контракт:** Branches; торговая точка. PK id; FK organization restrict; unique active code/name; RLS membership+branch access/support grant; owner command writes; delete запрещён, archive; source create/update branch; outbox `BranchCreated/Archived`; offline assigned branch snapshot.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Филиал |
+| organization_id | uuid | нет | — | Tenant |
+| code | text | нет | — | Код |
+| name | text | нет | — | Название |
+| address | text | да | — | Адрес |
+| phone | text | да | — | Телефон |
+| timezone | text | да | — | Override organization |
+| status | text | нет | `'active'` | `active`, `inactive`, `archived` |
+| legacy_store_id | uuid | да | — | Mapping V1 |
+| created_at | timestamptz | нет | now() | Создание |
+| updated_at | timestamptz | нет | now() | Изменение |
+| archived_at | timestamptz | да | — | Архив |
+
+Indexes `(organization_id,status,name)`, unique active `(organization_id,lower(code))`, unique non-null legacy id.
+
+## 16. Склады
+
+### `warehouses`
+
+**Контракт:** Warehouses; место ledger. PK id; FK branch/organization restrict; один primary на branch partial unique; RLS branch access; owner manage configuration; delete запрещён после любых движений, archive; outbox `WarehouseCreated/PrimaryChanged`; offline assigned warehouse.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Склад |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | нет | — | Филиал |
+| code | text | нет | — | Код |
+| name | text | нет | — | Название |
+| is_primary | boolean | нет | false | Основной |
+| allow_negative_stock | boolean | нет | false | Исключительная политика |
+| status | text | нет | `'active'` | Lifecycle |
+| created_at | timestamptz | нет | now() | Создание |
+| updated_at | timestamptz | нет | now() | Изменение |
+| archived_at | timestamptz | да | — | Архив |
+
+Unique `(organization_id,code)`, partial unique `(branch_id) where is_primary and archived_at is null`; checks tenant branch consistency. Индекс `(branch_id,status)`.
+
+## 17. Кассы
+
+### `registers`
+
+**Контракт:** Registers; логическая POS-касса. PK id; FK branch/default warehouse restrict; unique code per branch; RLS branch access; owner manage; delete запрещён после смены, archive; outbox `RegisterCreated/ConfigurationChanged`; offline assigned register.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Касса |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | нет | — | Филиал |
+| default_warehouse_id | uuid | нет | — | Единственный default warehouse |
+| code | text | нет | — | Код |
+| name | text | нет | — | Название |
+| settings | jsonb | нет | `'{}'` | Оплаты и печать |
+| status | text | нет | `'active'` | Lifecycle |
+| created_at | timestamptz | нет | now() | Создание |
+| updated_at | timestamptz | нет | now() | Изменение |
+| archived_at | timestamptz | да | — | Архив |
+
+Warehouse обязан принадлежать тому же branch. Unique `(branch_id,code)`. Индексы `(organization_id,branch_id,status)`.
+
+## 18. Устройства
+
+### `devices`
+
+**Контракт:** Devices; зарегистрированное offline-устройство. PK id; FK organization/branch/register restrict; unique fingerprint hash per tenant; RLS own assigned users/owner/support; registration/revoke commands; update только heartbeat/cursor server-side; delete запрещён, revoke; outbox `DeviceRegistered/Revoked`; является offline actor.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Device |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | нет | — | Филиал |
+| register_id | uuid | да | — | Касса |
+| name | text | нет | — | Имя |
+| device_type | text | нет | — | `desktop`, `tablet`, `mobile` |
+| fingerprint_hash | text | нет | — | Необратимый fingerprint |
+| status | text | нет | `'pending'` | `pending`, `trusted`, `revoked` |
+| last_sync_cursor | bigint | нет | `0` | Pull cursor |
+| last_seen_at | timestamptz | да | — | Heartbeat |
+| revoked_at | timestamptz | да | — | Отзыв |
+| created_at | timestamptz | нет | now() | Создание |
+| updated_at | timestamptz | нет | now() | Изменение |
+
+Unique `(organization_id,fingerprint_hash)`. Checks register belongs branch, revoked status/timestamp. Индексы `(organization_id,branch_id,status)`, `(register_id,status)`.
+
+## 19. Категории
+
+### `categories`
+
+**Контракт:** Catalog; tenant hierarchy. PK id; self FK parent set null; unique active normalized name under parent; RLS tenant read, catalog manage write; update draft metadata, delete запрещён, archive; source catalog commands; outbox `CategoryChanged`; offline reference projection.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Категория |
+| organization_id | uuid | нет | — | Tenant |
+| parent_id | uuid | да | — | Родитель той же organization |
+| name | text | нет | — | Название |
+| description | text | да | — | Описание |
+| sort_order | integer | нет | `0` | Сортировка |
+| status | text | нет | `'active'` | `active`, `inactive`, `archived` |
+| created_at | timestamptz | нет | now() | Создание |
+| updated_at | timestamptz | нет | now() | Изменение |
+| archived_at | timestamptz | да | — | Архив |
+
+Indexes `(organization_id,parent_id,sort_order)`, `(organization_id,status,name)`. Trigger/function запрещает цикл и cross-tenant parent.
+
+## 20. Бренды
+
+### `brands`
+
+**Контракт:** Catalog; бренд организации. PK id; unique active normalized name; RLS tenant read/catalog manage; update allowed, delete запрещён, archive; outbox `BrandChanged`; offline reference.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Бренд |
+| organization_id | uuid | нет | — | Tenant |
+| name | text | нет | — | Название |
+| description | text | да | — | Описание |
+| status | text | нет | `'active'` | Lifecycle |
+| created_at | timestamptz | нет | now() | Создание |
+| updated_at | timestamptz | нет | now() | Изменение |
+| archived_at | timestamptz | да | — | Архив |
+
+Partial unique `(organization_id,lower(name)) where archived_at is null`; index status/name.
+
+## 21. Единицы измерения
+
+### `units`
+
+**Контракт:** Catalog; tenant UOM. PK id; unique code and short name; RLS reference read/catalog manage; update label allowed before archive, delete запрещён if referenced; archive; outbox `UnitChanged`; offline reference.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Unit |
+| organization_id | uuid | нет | — | Tenant |
+| code | text | нет | — | Stable code |
+| name | text | нет | — | Название |
+| short_name | text | нет | — | Сокращение |
+| precision_scale | smallint | нет | `0` | Допустимая точность |
+| status | text | нет | `'active'` | Lifecycle |
+| created_at | timestamptz | нет | now() | Создание |
+| updated_at | timestamptz | нет | now() | Изменение |
+| archived_at | timestamptz | да | — | Архив |
+
+Checks scale 0..6; unique `(organization_id,code)` and active lower(short_name).
+
+## 22. Конверсии единиц
+
+### `unit_conversions`
+
+**Контракт:** Catalog; conversion к base unit товара. PK id; FK product/from/to unit restrict; unique triple; RLS product tenant; create/update catalog command, delete только пока нет document reference, иначе inactive; outbox `UnitConversionChanged`; offline full conversion.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Conversion |
+| organization_id | uuid | нет | — | Tenant |
+| product_id | uuid | нет | — | Товар |
+| from_unit_id | uuid | нет | — | Вводимая единица |
+| to_unit_id | uuid | нет | — | Base unit |
+| factor | numeric(20,10) | нет | — | Множитель |
+| status | text | нет | `'active'` | Lifecycle |
+| created_at | timestamptz | нет | now() | Создание |
+| updated_at | timestamptz | нет | now() | Изменение |
+
+Checks factor > 0, from != to, tenant consistency. Unique `(product_id,from_unit_id,to_unit_id)`. После использования изменение создаёт новую version, а документ хранит snapshot factor.
+
+## 23. Типы товаров
+
+### `product_types`
+
+**Контракт:** Catalog; поведение товара. PK id; unique code/name; RLS reference read/manage; update/archiving, delete запрещён; outbox `ProductTypeChanged`; offline reference.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Тип |
+| organization_id | uuid | нет | — | Tenant |
+| code | text | нет | — | Stable code |
+| name | text | нет | — | Название |
+| description | text | да | — | Описание |
+| behavior | jsonb | нет | `'{}'` | Weight/expiry flags defaults |
+| status | text | нет | `'active'` | Lifecycle |
+| created_at | timestamptz | нет | now() | Создание |
+| updated_at | timestamptz | нет | now() | Изменение |
+| archived_at | timestamptz | да | — | Архив |
+
+Unique `(organization_id,code)` and active name; behavior schema validated by application and constrained keys.
+
+## 24. Товары
+
+### `products`
+
+**Контракт:** Catalog; identity товара, без остатка и цены. PK id; FK category/brand/type/base unit restrict or set null only for optional references; unique SKU; RLS tenant safe read/catalog manage; update descriptive fields, delete запрещён, archive; source `create_or_update_product`; outbox `ProductCreated/Changed/Archived`; offline primary catalog projection.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Товар |
+| organization_id | uuid | нет | — | Tenant |
+| sku | text | да | — | Внутренний код |
+| name | text | нет | — | Название |
+| category_id | uuid | да | — | Категория |
+| brand_id | uuid | да | — | Бренд |
+| product_type_id | uuid | да | — | Тип |
+| base_unit_id | uuid | нет | — | Базовая единица |
+| description | text | да | — | Описание |
+| is_expirable | boolean | нет | false | Партии по срокам |
+| is_weighted | boolean | нет | false | Весовой товар |
+| min_quantity | numeric(18,6) | нет | `0` | Рекомендация, не остаток |
+| status | text | нет | `'active'` | Lifecycle |
+| version | bigint | нет | `1` | Optimistic lock |
+| created_at | timestamptz | нет | now() | Создание |
+| updated_at | timestamptz | нет | now() | Изменение |
+| archived_at | timestamptz | да | — | Архив |
+
+Checks min >= 0 and status. Partial unique `(organization_id,sku)` where sku not null and not archived. Index active search with trigram/full text. Архивный product отвергается posting functions.
+
+## 25. Штрихкоды
+
+### `product_barcodes`
+
+**Контракт:** Catalog; все баркоды. PK id; FK product restrict; уникален `(organization_id,normalized_barcode)`; RLS catalog read/manage; update запрещён после использования, замена archive+insert; delete только неиспользованный draft, иначе archive; outbox `BarcodeAssigned/Archived`; offline indexed lookup.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Barcode row |
+| organization_id | uuid | нет | — | Tenant |
+| product_id | uuid | нет | — | Товар |
+| barcode | text | нет | — | Исходное значение |
+| normalized_barcode | text | нет | — | Lookup value |
+| is_primary | boolean | нет | false | Основной |
+| status | text | нет | `'active'` | Lifecycle |
+| created_at | timestamptz | нет | now() | Создание |
+| archived_at | timestamptz | да | — | Архив |
+
+Unique active barcode per organization and one primary per product. Checks nonblank. Barcode lookup index является обязательным POS path.
+
+## 26. Изображения товаров
+
+### `product_images`
+
+**Контракт:** Catalog/Storage; metadata объекта. PK id; FK product restrict; unique storage path; RLS tenant read signed URL/manage; update sort/primary only, delete metadata после Storage retention job, archive first; outbox `ProductImageChanged`; offline thumbnail URL optional.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Image |
+| organization_id | uuid | нет | — | Tenant |
+| product_id | uuid | нет | — | Товар |
+| storage_bucket | text | нет | — | Private bucket |
+| storage_path | text | нет | — | Object key |
+| content_type | text | нет | — | MIME |
+| size_bytes | bigint | нет | — | Размер |
+| sort_order | integer | нет | `0` | Порядок |
+| is_primary | boolean | нет | false | Основное |
+| created_at | timestamptz | нет | now() | Создание |
+| archived_at | timestamptz | да | — | Архив |
+
+Checks size > 0, approved MIME. Unique bucket/path; one active primary per product.
+
+## 27. Прайс-листы
+
+### `price_lists`
+
+**Контракт:** Pricing; область цены. PK id; FK organization, optional branch; unique code per tenant; RLS safe read/pricing manage; update metadata, delete запрещён, archive; outbox `PriceListChanged`; offline assigned lists.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Price list |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | да | — | Branch override |
+| code | text | нет | — | Stable code |
+| name | text | нет | — | Название |
+| currency_code | char(3) | нет | — | Валюта |
+| is_default | boolean | нет | false | Default scope |
+| status | text | нет | `'active'` | Lifecycle |
+| created_at | timestamptz | нет | now() | Создание |
+| archived_at | timestamptz | да | — | Архив |
+
+Unique `(organization_id,code)`, partial unique default per scope. Branch tenant consistency.
+
+## 28. Продажные цены
+
+### `product_prices`
+
+**Контракт:** Pricing; подтверждённые версии sale price. PK id; FK product/list/request restrict; no overlapping active periods; RLS browser safe read, writes only `confirm_price_change`; update/delete запрещены, correction closes interval and inserts row; outbox `SalePriceConfirmed`; offline versioned price projection.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Price version |
+| organization_id | uuid | нет | — | Tenant |
+| price_list_id | uuid | нет | — | Прайс-лист |
+| product_id | uuid | нет | — | Товар |
+| amount | numeric(18,4) | нет | — | Цена |
+| currency_code | char(3) | нет | — | Валюта |
+| valid_from | timestamptz | нет | — | Начало |
+| valid_to | timestamptz | да | — | Исключающий конец |
+| confirmed_by | uuid | нет | — | Membership |
+| price_change_request_id | uuid | да | — | Основание |
+| created_at | timestamptz | нет | now() | Создание |
+
+Checks amount >= 0, valid_to > valid_from. Exclusion constraint по product/list/tstzrange не допускает две действующие цены. Индекс active lookup `(price_list_id,product_id,valid_from desc)`.
+
+## 29. История цен
+
+### `price_history`
+
+**Контракт:** Pricing append-only audit ledger; PK id; FK product/list/source restrict; RLS owner/pricing read, insert только pricing command; update/delete запрещены; reversal — новое событие; outbox не требуется, сама запись создаётся с price event; offline только current price, история owner-on-demand.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | History event |
+| organization_id | uuid | нет | — | Tenant |
+| price_list_id | uuid | нет | — | List |
+| product_id | uuid | нет | — | Product |
+| old_amount | numeric(18,4) | да | — | Было |
+| new_amount | numeric(18,4) | нет | — | Стало |
+| reason_code | text | нет | — | Причина |
+| source_type | text | нет | — | purchase/manual/import |
+| source_id | uuid | да | — | Документ |
+| changed_by | uuid | нет | — | Actor |
+| created_at | timestamptz | нет | now() | Время |
+
+Checks nonnegative values. Индекс `(organization_id,product_id,created_at desc)`. Reconciliation сверяет current product_prices с последним history event.
+
+## 30. Запросы и рекомендации изменения цены
+
+### `price_change_requests`
+
+**Контракт:** Pricing; workflow подтверждения. PK id; FK tenant/product/list/source; unique active request per source/product; RLS owner/pricing; create by purchase/manual, decision constrained update; delete запрещён, terminal retention; outbox `PriceChangeRequested/Resolved`; offline owner notification, seller read current only.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Request |
+| organization_id | uuid | нет | — | Tenant |
+| product_id | uuid | нет | — | Product |
+| price_list_id | uuid | нет | — | List |
+| current_amount | numeric(18,4) | нет | — | Текущая цена |
+| requested_amount | numeric(18,4) | нет | — | Предложение |
+| source_type | text | нет | — | Причина |
+| source_id | uuid | да | — | Приход |
+| status | text | нет | `'pending'` | pending/confirmed/rejected/expired |
+| requested_by | uuid | нет | — | Actor/system membership |
+| decided_by | uuid | да | — | Approver |
+| decided_at | timestamptz | да | — | Решение |
+| created_at | timestamptz | нет | now() | Создание |
+
+### `price_recommendations`
+
+**Контракт:** Pricing; расчётная рекомендация, не действующая цена. PK id; FK request/product; RLS owner/pricing; insert server calculation, immutable; delete retention allowed only after terminal request; outbox `SalePriceRecommended`; offline owner read.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Recommendation |
+| organization_id | uuid | нет | — | Tenant |
+| price_change_request_id | uuid | нет | — | Request |
+| product_id | uuid | нет | — | Product |
+| purchase_price | numeric(18,4) | нет | — | Новая закупочная |
+| previous_purchase_price | numeric(18,4) | да | — | Предыдущая |
+| margin_percent | numeric(9,4) | да | — | Наценка |
+| recommended_amount | numeric(18,4) | нет | — | Рекомендация |
+| calculation | jsonb | нет | `'{}'` | Объяснение |
+| created_at | timestamptz | нет | now() | Создание |
+
+Checks nonnegative. Request status consistency and indexes `(organization_id,status,created_at)` and `(product_id,created_at desc)`.
+
+```mermaid
+erDiagram
+  CATEGORIES ||--o{ PRODUCTS : classifies
+  BRANDS ||--o{ PRODUCTS : brands
+  PRODUCT_TYPES ||--o{ PRODUCTS : types
+  UNITS ||--o{ PRODUCTS : base_unit
+  PRODUCTS ||--o{ UNIT_CONVERSIONS : converts
+  PRODUCTS ||--o{ PRODUCT_BARCODES : identifies
+  PRODUCTS ||--o{ PRODUCT_IMAGES : illustrates
+  PRICE_LISTS ||--o{ PRODUCT_PRICES : contains
+  PRODUCTS ||--o{ PRODUCT_PRICES : priced
+  PRODUCTS ||--o{ PRICE_CHANGE_REQUESTS : requests
+  PRICE_CHANGE_REQUESTS ||--o{ PRICE_RECOMMENDATIONS : explains
+  PRODUCT_PRICES ||--o{ PRICE_HISTORY : records
+```
+
+## 31. Контрагенты
+
+### `counterparties`
+
+**Контракт:** Counterparties; единая party. PK id; unique optional tax/registration id; RLS tenant members by permission; create/update permitted, delete запрещён, archive; source counterparty commands/POS quick customer; outbox `CounterpartyChanged`; offline minimal customer projection, suppliers owner-side.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Counterparty |
+| organization_id | uuid | нет | — | Tenant |
+| display_name | text | нет | — | Имя |
+| legal_name | text | да | — | Юр. имя |
+| tax_id | text | да | — | ИНН |
+| notes | text | да | — | Заметка |
+| status | text | нет | `'active'` | Lifecycle |
+| created_at | timestamptz | нет | now() | Создание |
+| updated_at | timestamptz | нет | now() | Изменение |
+| archived_at | timestamptz | да | — | Архив |
+
+Partial unique normalized tax id. Index active name/trigram. Архивный party не используется в новых документах.
+
+## 32. Роли контрагента
+
+### `counterparty_roles`
+
+**Контракт:** Counterparties; supplier/customer markers. Unique pair; RLS as party; insert/delete role command with audit, update absent; physical delete allowed only before references, otherwise `ended_at`; outbox `CounterpartyRoleAdded/Ended`; offline relevant roles.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Role row |
+| organization_id | uuid | нет | — | Tenant |
+| counterparty_id | uuid | нет | — | Party |
+| role_code | text | нет | — | `supplier`, `customer` |
+| started_at | timestamptz | нет | now() | Начало |
+| ended_at | timestamptz | да | — | Завершение |
+
+Partial unique active `(counterparty_id,role_code)`. Checks role code.
+
+## 33. Контактные данные и адреса
+
+### `counterparty_contacts`
+
+**Контракт:** Counterparties; multiple contacts. RLS by party; CRUD while party active; delete allowed only non-historical contact, otherwise archive; no financial ownership; outbox `CounterpartyChanged`; offline selected phones.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Contact |
+| organization_id | uuid | нет | — | Tenant |
+| counterparty_id | uuid | нет | — | Party |
+| contact_type | text | нет | — | phone/email/person |
+| value | text | нет | — | Значение |
+| label | text | да | — | Подпись |
+| is_primary | boolean | нет | false | Основной |
+| created_at | timestamptz | нет | now() | Создание |
+| archived_at | timestamptz | да | — | Архив |
+
+### `counterparty_addresses`
+
+**Контракт:** Counterparties; delivery/legal addresses. Same RLS/lifecycle; outbox `CounterpartyChanged`; offline only needed delivery address.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Address |
+| organization_id | uuid | нет | — | Tenant |
+| counterparty_id | uuid | нет | — | Party |
+| address_type | text | нет | — | legal/delivery/other |
+| address_text | text | нет | — | Адрес |
+| metadata | jsonb | нет | `'{}'` | Geo/parts |
+| is_primary | boolean | нет | false | Основной |
+| created_at | timestamptz | нет | now() | Создание |
+| archived_at | timestamptz | да | — | Архив |
+
+### `counterparty_credit_settings`
+
+**Контракт:** Counterparties/Debts; tenant credit policy 1:1. PK/FK party; RLS owner full, seller reads effective limits; update owner command with audit; delete запрещён, disable; outbox `CreditTermsChanged`; offline signed policy snapshot.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| counterparty_id | uuid | нет | — | PK |
+| organization_id | uuid | нет | — | Tenant |
+| credit_enabled | boolean | нет | false | Разрешение |
+| credit_limit_amount | numeric(18,4) | нет | `0` | Лимит |
+| max_due_days | integer | нет | `0` | Срок |
+| currency_code | char(3) | нет | — | Валюта |
+| updated_by | uuid | нет | — | Actor |
+| updated_at | timestamptz | нет | now() | Изменение |
+
+Checks nonnegative. Partial unique primary contacts/addresses. Index normalized contact value for customer lookup.
+
+## 34. Документы закупки
+
+### `purchase_documents`
+
+**Контракт:** Purchases; header документа. PK id; FK tenant/branch/warehouse/counterparty/device/reversal restrict; unique document number and local operation key; RLS safe select by branch, draft insert/update by permission, posting command only; posted update/delete forbidden; reversal creates new document; outbox `PurchasePosted/Reversed`; offline quick purchase allowed by policy.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Purchase |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | нет | — | Филиал |
+| warehouse_id | uuid | нет | — | Склад |
+| counterparty_id | uuid | да | — | Supplier |
+| document_number | text | нет | — | Номер |
+| business_date | date | нет | — | Операционная дата |
+| status | text | нет | `'draft'` | draft/posted/reversed/cancelled |
+| currency_code | char(3) | нет | — | Валюта |
+| subtotal_amount | numeric(18,4) | нет | `0` | Строки |
+| additional_cost_amount | numeric(18,4) | нет | `0` | Расходы |
+| total_amount | numeric(18,4) | нет | `0` | Итог |
+| device_id | uuid | да | — | Offline device |
+| local_operation_id | uuid | да | — | Idempotency |
+| client_created_at | timestamptz | да | — | Client time |
+| posted_at | timestamptz | да | — | Проведение |
+| posted_by | uuid | да | — | Actor |
+| reversal_of_id | uuid | да | — | Исходный документ |
+| created_at | timestamptz | нет | now() | Создание |
+
+Checks totals >=0 and status timestamps. Unique `(organization_id,document_number)` and `(organization_id,device_id,local_operation_id)` where non-null. Index branch/business date/status.
+
+## 35. Строки закупки
+
+### `purchase_lines`
+
+**Контракт:** Purchases; immutable after post. PK id; FK purchase/product/unit restrict; unique line number; RLS via header; CRUD draft only; delete posted forbidden; reversal lines in reversal document; no own archive; outbox through header; offline embedded in command.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Line |
+| organization_id | uuid | нет | — | Tenant |
+| purchase_document_id | uuid | нет | — | Header |
+| line_number | integer | нет | — | Порядок |
+| product_id | uuid | нет | — | Product |
+| unit_id | uuid | нет | — | Введённая unit |
+| quantity | numeric(18,6) | нет | — | Введено |
+| unit_factor | numeric(20,10) | нет | — | Snapshot conversion |
+| base_quantity | numeric(18,6) | нет | — | Для склада |
+| unit_purchase_price | numeric(18,4) | нет | — | Закупочная |
+| line_amount | numeric(18,4) | нет | — | Округлённая сумма |
+| expiration_date | date | да | — | Срок |
+| supplier_batch_number | text | да | — | Номер поставщика |
+| created_at | timestamptz | нет | now() | Создание |
+
+Checks quantities/factor >0, prices >=0. Unique `(purchase_document_id,line_number)`. Index product and document.
+
+## 36. Дополнительные расходы закупки
+
+### `purchase_additional_costs`
+
+**Контракт:** Purchases; freight/tax/etc. Draft CRUD, immutable after post; RLS via header; delete posted forbidden; outbox via purchase; offline embedded.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Cost |
+| organization_id | uuid | нет | — | Tenant |
+| purchase_document_id | uuid | нет | — | Purchase |
+| cost_type | text | нет | — | Freight/tax/other |
+| amount | numeric(18,4) | нет | — | Сумма |
+| currency_code | char(3) | нет | — | Валюта |
+| allocation_method | text | нет | — | amount/quantity/weight/manual |
+| created_at | timestamptz | нет | now() | Создание |
+
+### `purchase_cost_allocations`
+
+**Контракт:** Purchases; immutable allocation cost→line. Создаётся `post_purchase`; browser write/update/delete запрещены; RLS owner read; reversal через reversal purchase; reconciliation sum to cost.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Allocation |
+| organization_id | uuid | нет | — | Tenant |
+| purchase_additional_cost_id | uuid | нет | — | Cost |
+| purchase_line_id | uuid | нет | — | Line |
+| allocated_amount | numeric(18,4) | нет | — | Распределено |
+| created_at | timestamptz | нет | now() | Создание |
+
+Unique pair, checks positive; sum allocations equals cost at posting.
+
+## 37. Партии товаров
+
+### `product_batches`
+
+**Контракт:** Inventory; lot created by posted purchase line, not document itself. PK id; FK warehouse/product/purchase line restrict; unique warehouse/batch code; RLS safe inventory read, insert only posting functions; update only controlled lifecycle metadata; delete forbidden, closed/expired statuses; outbox `BatchCreated/Depleted`; offline stock projection.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Batch |
+| organization_id | uuid | нет | — | Tenant |
+| warehouse_id | uuid | нет | — | Warehouse |
+| product_id | uuid | нет | — | Product |
+| purchase_line_id | uuid | нет | — | Source |
+| batch_code | text | нет | — | Internal code |
+| supplier_batch_number | text | да | — | External |
+| received_date | date | нет | — | Приход |
+| expiration_date | date | да | — | Срок |
+| initial_quantity | numeric(18,6) | нет | — | Initial |
+| purchase_unit_cost | numeric(18,4) | нет | — | Purchase + allocated cost |
+| currency_code | char(3) | нет | — | Валюта |
+| status | text | нет | `'open'` | open/depleted/blocked/reversed |
+| created_at | timestamptz | нет | now() | Создание |
+
+Закупочная цена не является sale price. Current quantity не хранится здесь как ledger truth. Index FEFO `(warehouse_id,product_id,expiration_date)` where open.
+
+## 38. Документы ежедневной поставки
+
+### `daily_delivery_templates`
+
+**Контракт:** Purchases; reusable draft pattern. Tenant/branch/counterparty scoped; owner manage; update/delete allowed only template, archive; outbox `DailyDeliveryTemplateChanged`; offline available.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Template |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | нет | — | Branch |
+| counterparty_id | uuid | нет | — | Supplier/customer |
+| name | text | нет | — | Название |
+| default_lines | jsonb | нет | `'[]'` | Product/unit template |
+| status | text | нет | `'active'` | Lifecycle |
+| created_at | timestamptz | нет | now() | Создание |
+| updated_at | timestamptz | нет | now() | Изменение |
+| archived_at | timestamptz | да | — | Архив |
+
+### `daily_delivery_documents`
+
+**Контракт:** Purchases; отдельный daily wrapper 1:1 к purchase. PK id; FK template/purchase unique; created by `post_daily_delivery`; immutable, no delete, reversal follows purchase; RLS branch; outbox `DailyDeliveryPosted`; offline sync metadata inherited from purchase.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Daily doc |
+| organization_id | uuid | нет | — | Tenant |
+| template_id | uuid | да | — | Template |
+| purchase_document_id | uuid | нет | — | Posted purchase |
+| delivery_date | date | нет | — | Отдельный день |
+| sequence_number | integer | нет | — | Номер в день |
+| created_at | timestamptz | нет | now() | Создание |
+
+Unique purchase and `(counterparty/template,delivery_date,sequence_number)` as applicable.
+
+## 39. Складские документы
+
+### `inventory_documents`
+
+**Контракт:** Inventory; header adjustment/write-off/transfer receipt/opening/reversal. PK id; FK tenant/warehouse/device/reversal; RLS branch safe read, drafts by permission, post RPC; posted immutable/delete forbidden; outbox `InventoryDocumentPosted/Reversed`; offline only allowed command types.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Document |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | нет | — | Branch |
+| warehouse_id | uuid | нет | — | Primary scope |
+| document_type | text | нет | — | opening/adjustment/write_off/transfer/reversal |
+| document_number | text | нет | — | Number |
+| business_date | date | нет | — | Date |
+| status | text | нет | `'draft'` | draft/posted/reversed/cancelled |
+| reason_code | text | нет | — | Reason |
+| device_id | uuid | да | — | Offline |
+| local_operation_id | uuid | да | — | Idempotency |
+| posted_by | uuid | да | — | Actor |
+| posted_at | timestamptz | да | — | Posted |
+| reversal_of_id | uuid | да | — | Original |
+| created_at | timestamptz | нет | now() | Created |
+
+### `inventory_document_lines`
+
+**Контракт:** Inventory; draft lines and immutable posted source. RLS via header; CRUD draft, no delete after post; outbox through header; offline embedded.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Line |
+| organization_id | uuid | нет | — | Tenant |
+| inventory_document_id | uuid | нет | — | Header |
+| line_number | integer | нет | — | Order |
+| product_id | uuid | нет | — | Product |
+| batch_id | uuid | да | — | Batch |
+| unit_id | uuid | нет | — | Unit |
+| quantity | numeric(18,6) | нет | — | Entered |
+| unit_factor | numeric(20,10) | нет | — | Snapshot |
+| base_quantity_delta | numeric(18,6) | нет | — | Signed change |
+| comment | text | да | — | Reason details |
+
+Unique document/line. Checks nonzero delta. Header numbering indexes.
+
+## 40. Складские движения
+
+### `inventory_movements`
+
+**Контракт:** Inventory append-only source of truth. PK id; all FK restrict; unique `(source_type,source_line_id,movement_role)`; RLS safe projection-oriented select, direct browser writes forbidden; update/delete forbidden; reversal is opposite row linked by `reversal_of_id`; source posting commands; outbox `StockMoved`; offline pull projection, not raw full ledger by default.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Movement |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | нет | — | Branch |
+| warehouse_id | uuid | нет | — | Warehouse |
+| product_id | uuid | нет | — | Product |
+| batch_id | uuid | да | — | Batch |
+| movement_type | text | нет | — | purchase/sale/return/transfer/etc |
+| quantity_delta | numeric(18,6) | нет | — | Signed base quantity |
+| source_document_type | text | нет | — | Source kind |
+| source_document_id | uuid | нет | — | Source header |
+| source_line_id | uuid | нет | — | Source line |
+| movement_role | text | нет | `'primary'` | out/in/reversal |
+| reversal_of_id | uuid | да | — | Original movement |
+| command_id | uuid | нет | — | Command log |
+| created_by | uuid | нет | — | Actor membership |
+| created_at | timestamptz | нет | now() | Ledger time |
+
+Checks delta != 0, reversal opposite sign/same product/warehouse. Index `(warehouse_id,product_id,batch_id,created_at,id)`, source lookup, organization created_at.
+
+Current projection = sum deltas; reconciliation recomputes balances and reports any difference. Ошибочная запись исправляется только reversal + correct document.
+
+## 41. Проекция остатков
+
+### `inventory_balances`
+
+**Контракт:** Inventory mutable projection, не ledger. Composite logical key warehouse/product/batch; FK restrict; RLS browser safe assigned warehouse select; writes only posting/rebuild functions; delete only rebuild maintenance; no archive; no outbox independent; offline primary stock source.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Projection row |
+| organization_id | uuid | нет | — | Tenant |
+| warehouse_id | uuid | нет | — | Warehouse |
+| product_id | uuid | нет | — | Product |
+| batch_id | uuid | да | — | Null aggregate or batch row |
+| on_hand_quantity | numeric(18,6) | нет | `0` | Physical ledger sum |
+| reserved_quantity | numeric(18,6) | нет | `0` | Reservations |
+| available_quantity | numeric(18,6) | нет | `0` | on_hand-reserved |
+| last_movement_id | uuid | да | — | Cursor |
+| version | bigint | нет | `0` | Optimistic lock |
+| updated_at | timestamptz | нет | now() | Projection time |
+
+Unique `(warehouse_id,product_id,batch_id)` with nulls not distinct. Checks reserved >=0, available = on_hand-reserved; negative on_hand denied unless warehouse policy.
+
+При двух продажах `post_sale` locks aggregate balance rows in deterministic product order, verifies available, allocates FEFO batch rows, inserts movements and increments projection/version. Вторая transaction ждёт lock и видит новый остаток; при недостатке получает `insufficient_stock`, если negative policy не разрешена.
+
+## 42. Инвентаризация
+
+### `inventory_counts`
+
+**Контракт:** Inventory; count session/document. RLS branch; draft counting updates, posting command freezes; delete only empty draft, posted forbidden; reversal adjustment; outbox `InventoryCountPosted`; offline count may sync with version conflict.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Count |
+| organization_id | uuid | нет | — | Tenant |
+| warehouse_id | uuid | нет | — | Warehouse |
+| business_date | date | нет | — | Date |
+| status | text | нет | `'draft'` | draft/counting/posted/cancelled |
+| snapshot_cursor | bigint | нет | — | Starting projection |
+| started_by | uuid | нет | — | Actor |
+| posted_by | uuid | да | — | Actor |
+| posted_at | timestamptz | да | — | Posted |
+| created_at | timestamptz | нет | now() | Created |
+
+### `inventory_count_lines`
+
+**Контракт:** Inventory; expected/actual snapshot. RLS via count; update actual while counting; immutable after post; no delete after post; posting creates adjustment document/movements.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Count line |
+| organization_id | uuid | нет | — | Tenant |
+| inventory_count_id | uuid | нет | — | Count |
+| product_id | uuid | нет | — | Product |
+| batch_id | uuid | да | — | Batch |
+| expected_quantity | numeric(18,6) | нет | — | Snapshot |
+| actual_quantity | numeric(18,6) | да | — | Counted |
+| difference_quantity | numeric(18,6) | да | — | Actual-expected |
+| counted_by | uuid | да | — | Actor |
+| counted_at | timestamptz | да | — | Time |
+
+Unique count/product/batch. Index status/date and missing actual lines.
+
+## 43. Перемещения между складами
+
+### `warehouse_transfers`
+
+**Контракт:** Inventory; paired warehouse document. PK id; FK source/destination restrict; RLS access to both warehouses; draft CRUD/post command; posted delete forbidden, reversal transfer; outbox `WarehouseTransferPosted`; offline disabled Core Pilot unless both projections current.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Transfer |
+| organization_id | uuid | нет | — | Tenant |
+| source_warehouse_id | uuid | нет | — | From |
+| destination_warehouse_id | uuid | нет | — | To |
+| document_number | text | нет | — | Number |
+| business_date | date | нет | — | Date |
+| status | text | нет | `'draft'` | draft/posted/reversed/cancelled |
+| posted_by | uuid | да | — | Actor |
+| posted_at | timestamptz | да | — | Posted |
+| reversal_of_id | uuid | да | — | Original |
+| created_at | timestamptz | нет | now() | Created |
+
+### `warehouse_transfer_lines`
+
+**Контракт:** Inventory; quantities. RLS via transfer; draft CRUD, posted immutable; posting creates paired out/in movements sharing line.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Line |
+| organization_id | uuid | нет | — | Tenant |
+| warehouse_transfer_id | uuid | нет | — | Header |
+| line_number | integer | нет | — | Order |
+| product_id | uuid | нет | — | Product |
+| source_batch_id | uuid | да | — | Batch |
+| quantity | numeric(18,6) | нет | — | Base quantity |
+
+Checks source != destination, quantity >0. Unique header/line. Locks source balances then destination in UUID order to avoid deadlock.
+
+## 44. Списания
+
+Списание не создаёт отдельную дублирующую таблицу: это `inventory_documents.document_type='write_off'` со строками и отрицательными `inventory_movements`. Причина обязательна; превышение лимита требует `approval_request`. Проведённое списание не удаляется, reversal создаёт обратные движения. Это сохраняет одну ответственность Inventory Documents.
+
+## 45. Продажи
+
+### `sales`
+
+**Контракт:** Sales; posted sale header. PK id; FK tenant/branch/register/warehouse/shift/customer/device/reversal restrict; unique number/idempotency; RLS branch safe read, draft/held separately, insert only `post_sale`; update/delete posted запрещены; reversal document; outbox `SalePosted/Reversed`; offline primary command/result.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Sale |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | нет | — | Branch |
+| register_id | uuid | нет | — | Register |
+| warehouse_id | uuid | нет | — | Stock source |
+| shift_id | uuid | нет | — | Open shift |
+| customer_counterparty_id | uuid | да | — | Customer |
+| document_number | text | нет | — | Number |
+| business_date | date | нет | — | Date |
+| status | text | нет | `'posted'` | posted/reversed/partially_returned/returned |
+| currency_code | char(3) | нет | — | Currency |
+| subtotal_amount | numeric(18,4) | нет | — | Before discount |
+| discount_amount | numeric(18,4) | нет | `0` | Discount |
+| tax_amount | numeric(18,4) | нет | `0` | Tax |
+| total_amount | numeric(18,4) | нет | — | Total |
+| paid_amount | numeric(18,4) | нет | `0` | Payments |
+| debt_amount | numeric(18,4) | нет | `0` | Receivable |
+| device_id | uuid | нет | — | Device |
+| local_operation_id | uuid | нет | — | Idempotency |
+| client_created_at | timestamptz | нет | — | Client time |
+| posted_by | uuid | нет | — | Membership |
+| posted_at | timestamptz | нет | now() | Server time |
+| reversal_of_id | uuid | да | — | Original |
+
+Checks totals nonnegative and `paid_amount + debt_amount = total_amount`; customer required if debt > 0. Unique `(organization_id,document_number)` and `(organization_id,device_id,local_operation_id)`. Index register/business date, shift, customer/date.
+
+### `held_sales`
+
+**Контракт:** Sales; mutable temporary cart, not financial document. PK id; branch/register/user scoped; RLS creator/authorized seller; CRUD allowed, TTL delete allowed; no ledger/outbox except optional `HeldSaleChanged`; offline local-first with optional server backup.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Held cart |
+| organization_id | uuid | нет | — | Tenant |
+| register_id | uuid | нет | — | Register |
+| created_by | uuid | нет | — | Membership |
+| cart_payload | jsonb | нет | — | Versioned draft |
+| expires_at | timestamptz | нет | — | TTL |
+| created_at | timestamptz | нет | now() | Created |
+| updated_at | timestamptz | нет | now() | Updated |
+
+Index `(register_id,created_by,updated_at desc)` and TTL. Payload schema validated by application.
+
+## 46. Строки продажи
+
+### `sale_lines`
+
+**Контракт:** Sales; immutable item snapshot. FK sale/product/unit/batch restrict; RLS via sale; insert only `post_sale`, update/delete forbidden; reversal/return separate lines; outbox via sale; offline embedded result.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Line |
+| organization_id | uuid | нет | — | Tenant |
+| sale_id | uuid | нет | — | Header |
+| line_number | integer | нет | — | Order |
+| product_id | uuid | нет | — | Product |
+| product_name_snapshot | text | нет | — | Historical name |
+| unit_id | uuid | нет | — | Unit |
+| unit_name_snapshot | text | нет | — | Historical unit |
+| quantity | numeric(18,6) | нет | — | Entered |
+| unit_factor | numeric(20,10) | нет | — | Conversion |
+| base_quantity | numeric(18,6) | нет | — | Stock quantity |
+| unit_sale_price | numeric(18,4) | нет | — | Confirmed snapshot |
+| unit_cost | numeric(18,4) | нет | — | Allocated cost |
+| discount_amount | numeric(18,4) | нет | `0` | Discount |
+| tax_amount | numeric(18,4) | нет | `0` | Tax |
+| line_total_amount | numeric(18,4) | нет | — | Total |
+
+Unique sale/line; checks quantity/factor >0 and amounts >=0. Batch allocation may create multiple internal movement rows for one sale line.
+
+## 47. Платежи
+
+### `payments`
+
+**Контракт:** Payments append-only; one row per actual method, never `mixed`. FK sale/debt payment/shift/register/device/reversal restrict; RLS owner and seller own shift; insert only payment commands, update/delete forbidden; refund/reversal opposite row; outbox `PaymentAccepted/Refunded`; offline command result.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Payment |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | нет | — | Branch |
+| register_id | uuid | нет | — | Register |
+| shift_id | uuid | нет | — | Shift |
+| sale_id | uuid | да | — | Sale |
+| debt_payment_id | uuid | да | — | Debt repayment |
+| method | text | нет | — | cash/card/transfer/provider |
+| amount | numeric(18,4) | нет | — | Signed amount |
+| currency_code | char(3) | нет | — | Currency |
+| provider_reference | text | да | — | External id |
+| status | text | нет | `'confirmed'` | pending/confirmed/failed/reversed |
+| device_id | uuid | нет | — | Device |
+| local_operation_id | uuid | нет | — | Idempotency |
+| reversal_of_id | uuid | да | — | Original |
+| created_by | uuid | нет | — | Actor |
+| created_at | timestamptz | нет | now() | Time |
+
+Exactly one source sale/debt payment; amount nonzero; provider ref unique per provider when set. Unique local operation scope. Index shift/method, sale, created_at.
+
+## 48. Возвраты продажи
+
+### `sale_returns`
+
+**Контракт:** Sales; return header linked to original sale. RLS branch; insert only `post_sale_return`; immutable/delete forbidden; reversal possible; outbox `SaleReturned`; offline only with original sale snapshot.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Return |
+| organization_id | uuid | нет | — | Tenant |
+| original_sale_id | uuid | нет | — | Original |
+| register_id | uuid | нет | — | Register |
+| shift_id | uuid | нет | — | Shift |
+| document_number | text | нет | — | Number |
+| status | text | нет | `'posted'` | posted/reversed |
+| total_amount | numeric(18,4) | нет | — | Refund total |
+| debt_reduction_amount | numeric(18,4) | нет | `0` | Unpaid portion |
+| device_id | uuid | нет | — | Device |
+| local_operation_id | uuid | нет | — | Idempotency |
+| posted_by | uuid | нет | — | Actor |
+| posted_at | timestamptz | нет | now() | Time |
+| reversal_of_id | uuid | да | — | Reversal |
+
+### `sale_return_lines`
+
+**Контракт:** Sales; immutable returned quantities. RLS via return; insert command-only; no update/delete; stock movements reference line; outbox via header.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Line |
+| organization_id | uuid | нет | — | Tenant |
+| sale_return_id | uuid | нет | — | Header |
+| original_sale_line_id | uuid | нет | — | Sold line |
+| quantity | numeric(18,6) | нет | — | Returned base qty |
+| refund_amount | numeric(18,4) | нет | — | Refund |
+| debt_reduction_amount | numeric(18,4) | нет | `0` | Debt impact |
+
+Returned cumulative quantity and amount cannot exceed original less previous returns. Debt reduction cannot exceed unpaid allocation attributable to returned lines.
+
+## 49. Сторнирование и корректировки
+
+Проведённая продажа, закупка, возврат, inventory document, payment или settlement entry не обновляется и не удаляется. Reversal:
+
+1. locks original and checks not already fully reversed;
+2. creates new header with `reversal_of_id`;
+3. creates opposite payment, inventory, receivable/settlement and cash movements;
+4. marks original lifecycle status only as derived convenience;
+5. writes audit and outbox in the same transaction.
+
+Корректировка — reversal ошибочного документа и новый правильный документ. Ledger rows update/delete запрещены database grants и defensive trigger.
+
+## 50. Дебиторская задолженность
+
+### `receivables`
+
+**Контракт:** Debts; obligation tied to exact sale. FK sale/customer restrict, unique sale; RLS owner and authorized seller; insert only `post_sale`; current projection fields update only debt functions under lock; delete forbidden, write-off/reversal ledger command; outbox `DebtOpened/StatusChanged`; offline customer debt projection.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Receivable |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | нет | — | Branch |
+| counterparty_id | uuid | нет | — | Customer |
+| sale_id | uuid | нет | — | Source |
+| original_amount | numeric(18,4) | нет | — | Initial debt |
+| outstanding_amount | numeric(18,4) | нет | — | Projection |
+| currency_code | char(3) | нет | — | Currency |
+| due_date | date | да | — | Due |
+| status | text | нет | `'open'` | open/partial/paid/written_off/reversed |
+| version | bigint | нет | `1` | Lock |
+| created_at | timestamptz | нет | now() | Created |
+| closed_at | timestamptz | да | — | Closed |
+
+Checks `0 <= outstanding <= original`; unique sale; indexes customer/status/due date. Source truth is sale plus allocations; projection reconciled.
+
+## 51. Погашения долга
+
+### `debt_payments`
+
+**Контракт:** Debts; repayment document, linked payments. PK id; branch/customer/shift/device; RLS authorized; insert only `record_debt_payment`; immutable/delete forbidden; reversal document; outbox `DebtPaymentRecorded/Reversed`; offline allowed within policy.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Repayment |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | нет | — | Branch |
+| counterparty_id | uuid | нет | — | Customer |
+| shift_id | uuid | нет | — | Shift |
+| total_amount | numeric(18,4) | нет | — | Amount |
+| currency_code | char(3) | нет | — | Currency |
+| status | text | нет | `'posted'` | posted/reversed |
+| device_id | uuid | нет | — | Device |
+| local_operation_id | uuid | нет | — | Idempotency |
+| posted_by | uuid | нет | — | Actor |
+| posted_at | timestamptz | нет | now() | Time |
+| reversal_of_id | uuid | да | — | Original |
+
+Checks amount >0; unique operation scope. Sum linked payment rows equals total.
+
+## 52. Распределение платежей по долгам
+
+### `debt_allocations`
+
+**Контракт:** Debts append-only allocation repayment/return/write-off → receivable. RLS authorized read; insert debt functions; update/delete forbidden; reversal opposite allocation linked; outbox `DebtPartiallyRepaid/Closed`; offline result projection.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Allocation |
+| organization_id | uuid | нет | — | Tenant |
+| receivable_id | uuid | нет | — | Debt |
+| debt_payment_id | uuid | да | — | Repayment |
+| sale_return_id | uuid | да | — | Return reduction |
+| allocation_type | text | нет | — | payment/return/write_off/reversal |
+| amount | numeric(18,4) | нет | — | Signed |
+| reversal_of_id | uuid | да | — | Original |
+| created_by | uuid | нет | — | Actor |
+| created_at | timestamptz | нет | now() | Time |
+
+Exactly one source, nonzero amount. Function locks receivable and refuses allocation over outstanding. Reconciliation: original amount minus allocations equals projection.
+
+```mermaid
+erDiagram
+  SHIFTS ||--o{ SALES : groups
+  SALES ||--|{ SALE_LINES : contains
+  SALES ||--o{ PAYMENTS : paid_by
+  SALES ||--o| RECEIVABLES : opens
+  SALES ||--o{ SALE_RETURNS : returned_by
+  SALE_RETURNS ||--|{ SALE_RETURN_LINES : contains
+  RECEIVABLES ||--o{ DEBT_ALLOCATIONS : reduced_by
+  DEBT_PAYMENTS ||--o{ PAYMENTS : receives
+  DEBT_PAYMENTS ||--o{ DEBT_ALLOCATIONS : allocates
+```
+
+## 53. Взаиморасчёты с контрагентами
+
+Settlements использует единый signed ledger: положительное значение означает долг контрагента магазину, отрицательное — долг магазина контрагенту. Первичные purchase/sale/goods-taken/payment документы не объединяются и остаются источниками строк.
+
+## 54. Записи ledger взаиморасчётов
+
+### `settlement_entries`
+
+**Контракт:** Settlements append-only source. FK counterparty/source/period/reversal restrict; RLS owner/settlement permission; insert posting functions; update/delete forbidden; reversal opposite row; outbox `SettlementEntryPosted`; offline owner projection only.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Entry |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | нет | — | Branch |
+| counterparty_id | uuid | нет | — | Party |
+| entry_type | text | нет | — | supply/payment/goods_taken/offset/etc |
+| amount_delta | numeric(18,4) | нет | — | Signed |
+| currency_code | char(3) | нет | — | Currency |
+| business_date | date | нет | — | Date |
+| source_document_type | text | нет | — | Source |
+| source_document_id | uuid | нет | — | Header |
+| settlement_period_id | uuid | да | — | Closed period |
+| reversal_of_id | uuid | да | — | Original |
+| created_by | uuid | нет | — | Actor |
+| created_at | timestamptz | нет | now() | Time |
+
+Unique `(source_document_type,source_document_id,entry_type)` as appropriate; amount nonzero. Index counterparty/business date and open period.
+
+## 55. Акты сверки и закрытие периода
+
+### `settlement_periods`
+
+**Контракт:** Settlements; close boundary. RLS owner; insert/close command; closed update/delete forbidden; correction in next period; outbox `SettlementPeriodClosed`; no offline close.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Period |
+| organization_id | uuid | нет | — | Tenant |
+| counterparty_id | uuid | нет | — | Party |
+| starts_on | date | нет | — | Inclusive |
+| ends_on | date | нет | — | Exclusive |
+| status | text | нет | `'open'` | open/closed/corrected |
+| opening_balance | numeric(18,4) | нет | `0` | Opening |
+| closing_balance | numeric(18,4) | да | — | Who owes whom |
+| closed_by | uuid | да | — | Actor |
+| closed_at | timestamptz | да | — | Time |
+| created_at | timestamptz | нет | now() | Created |
+
+### `settlement_acts`
+
+**Контракт:** Settlements; immutable closing snapshot 1:1 period. Insert close command; no update/delete; RLS owner; outbox `SettlementActCreated`; downloadable report.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Act |
+| organization_id | uuid | нет | — | Tenant |
+| settlement_period_id | uuid | нет | — | Period |
+| act_number | text | нет | — | Number |
+| total_debit | numeric(18,4) | нет | — | Debit |
+| total_credit | numeric(18,4) | нет | — | Credit |
+| closing_balance | numeric(18,4) | нет | — | Net |
+| snapshot_hash | text | нет | — | Integrity |
+| created_by | uuid | нет | — | Actor |
+| created_at | timestamptz | нет | now() | Time |
+
+### `settlement_act_lines`
+
+**Контракт:** Settlements; immutable snapshot lines. FK act/entry restrict; insert close command only; no update/delete; RLS via act.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Line |
+| organization_id | uuid | нет | — | Tenant |
+| settlement_act_id | uuid | нет | — | Act |
+| settlement_entry_id | uuid | нет | — | Ledger row |
+| line_number | integer | нет | — | Order |
+| amount_delta | numeric(18,4) | нет | — | Snapshot |
+
+Periods for one counterparty/currency cannot overlap (exclusion constraint). Act number unique tenant. Closed period blocks new entries with business date inside; correction points to later period.
+
+```mermaid
+erDiagram
+  COUNTERPARTIES ||--o{ SETTLEMENT_ENTRIES : has
+  PURCHASE_DOCUMENTS ||--o{ SETTLEMENT_ENTRIES : creates
+  SALES ||--o{ SETTLEMENT_ENTRIES : creates
+  SETTLEMENT_PERIODS ||--o{ SETTLEMENT_ENTRIES : closes
+  SETTLEMENT_PERIODS ||--|| SETTLEMENT_ACTS : produces
+  SETTLEMENT_ACTS ||--|{ SETTLEMENT_ACT_LINES : snapshots
+  SETTLEMENT_ENTRIES ||--o| SETTLEMENT_ACT_LINES : included
+```
+
+## 56. Кассовые смены
+
+### `shifts`
+
+**Контракт:** Shifts; register session. RLS branch seller own/owner; open/close RPC only; open status permits limited updates, closed immutable/delete forbidden; outbox `ShiftOpened/Closed`; offline active shift snapshot.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Shift |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | нет | — | Branch |
+| register_id | uuid | нет | — | Register |
+| opened_by | uuid | нет | — | Membership |
+| opening_cash_amount | numeric(18,4) | нет | `0` | Opening |
+| status | text | нет | `'open'` | open/closing/closed |
+| opened_at | timestamptz | нет | now() | Open |
+| closed_by | uuid | да | — | Actor |
+| closed_at | timestamptz | да | — | Close |
+| actual_cash_amount | numeric(18,4) | да | — | Count |
+| difference_amount | numeric(18,4) | да | — | Difference |
+| version | bigint | нет | `1` | Lock |
+
+Partial unique one open shift per register Core Pilot. Closed status requires close fields. Index branch/date.
+
+### `shift_totals`
+
+**Контракт:** Shifts projection/snapshot by payment method. FK shift; RLS shift; update only while open by payment command, frozen at close; delete only projection rebuild before close; no independent outbox; offline totals.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Total |
+| organization_id | uuid | нет | — | Tenant |
+| shift_id | uuid | нет | — | Shift |
+| payment_method | text | нет | — | Method |
+| expected_amount | numeric(18,4) | нет | `0` | Ledger sum |
+| actual_amount | numeric(18,4) | да | — | Count |
+| version | bigint | нет | `0` | Projection |
+| updated_at | timestamptz | нет | now() | Updated |
+
+Unique shift/method. Reconciliation sums payments and cash movements.
+
+## 57. Кассовые движения
+
+### `cash_movements`
+
+**Контракт:** Payments/Shifts append-only cash ledger. FK shift/register/source/reversal; RLS own shift/owner; insert `record_cash_movement` and payment commands; update/delete forbidden; reversal opposite; outbox `CashMovementPosted`; offline queue.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Movement |
+| organization_id | uuid | нет | — | Tenant |
+| register_id | uuid | нет | — | Register |
+| shift_id | uuid | нет | — | Shift |
+| movement_type | text | нет | — | sale/in/out/refund/debt_payment |
+| amount_delta | numeric(18,4) | нет | — | Signed cash |
+| source_type | text | нет | — | Source |
+| source_id | uuid | нет | — | Document |
+| reason | text | да | — | Required manual in/out |
+| device_id | uuid | нет | — | Device |
+| local_operation_id | uuid | нет | — | Idempotency |
+| reversal_of_id | uuid | да | — | Original |
+| created_by | uuid | нет | — | Actor |
+| created_at | timestamptz | нет | now() | Time |
+
+Amount nonzero; reason required manual movement. Unique local operation and source role.
+
+## 58. Фискальные чеки
+
+### `fiscal_documents`
+
+**Контракт:** Fiscal; one fiscal intent/result per sale/return. RLS owner/seller own shift; insert transactional intent, status update adapter only; delete forbidden; retry same idempotency key; outbox `FiscalizationRequested/Completed/Failed`; offline queued according policy.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Fiscal doc |
+| organization_id | uuid | нет | — | Tenant |
+| source_type | text | нет | — | sale/return |
+| source_id | uuid | нет | — | Source |
+| provider_code | text | нет | — | Adapter |
+| status | text | нет | `'pending'` | pending/processing/issued/deferred/failed/cancelled |
+| idempotency_key | text | нет | — | Provider key |
+| external_receipt_id | text | да | — | External |
+| fiscal_sign | text | да | — | Fiscal sign |
+| issued_at | timestamptz | да | — | Time |
+| created_at | timestamptz | нет | now() | Created |
+| updated_at | timestamptz | нет | now() | Updated |
+
+### `fiscal_attempts`
+
+**Контракт:** Fiscal technical append log. FK document; RLS owner/support grant; insert worker; update/delete forbidden until retention expiry; no reversal; outbox not needed.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Attempt |
+| fiscal_document_id | uuid | нет | — | Document |
+| attempt_number | integer | нет | — | Sequence |
+| request_hash | text | нет | — | Safe hash |
+| response_code | text | да | — | Result |
+| response_payload | jsonb | да | — | Redacted response |
+| error_code | text | да | — | Error |
+| created_at | timestamptz | нет | now() | Time |
+
+Unique source and provider idempotency; attempts unique document/number.
+
+## 59. Sync commands
+
+### `sync_commands`
+
+**Контракт:** Sync; received command envelope. FK tenant/device/actor/command result; RLS device own results/owner; insert only `submit_sync_command`, status update processor; delete by long retention only after terminal; no business update; outbox sync events; primary offline bridge.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Sync row |
+| organization_id | uuid | нет | — | Tenant |
+| device_id | uuid | нет | — | Device |
+| actor_membership_id | uuid | нет | — | Actor |
+| local_operation_id | uuid | нет | — | Client key |
+| command_type | text | нет | — | Command |
+| schema_version | integer | нет | — | Payload version |
+| payload | jsonb | нет | — | Immutable payload |
+| payload_hash | text | нет | — | Integrity |
+| status | text | нет | `'received'` | received/processing/accepted/rejected/conflict |
+| result | jsonb | да | — | Stable response |
+| error_code | text | да | — | Stable error |
+| client_created_at | timestamptz | нет | — | Client time |
+| received_at | timestamptz | нет | now() | Server time |
+| processed_at | timestamptz | да | — | Complete |
+
+Unique `(organization_id,device_id,local_operation_id)`. Queue index `(status,received_at)` and device history.
+
+## 60. Command log и идемпотентность
+
+### `command_log`
+
+**Контракт:** shared infrastructure; canonical idempotency record for online/offline commands. PK id; unique operation scope; RLS no browser direct access except own result view; insert/update transaction executor; delete retention after all references; result immutable after terminal; no archive; events through business outbox.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Command id |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | да | — | Scope |
+| device_id | uuid | да | — | Device |
+| actor_membership_id | uuid | нет | — | Actor |
+| local_operation_id | uuid | нет | — | Idempotency |
+| command_type | text | нет | — | Type |
+| payload_hash | text | нет | — | Hash |
+| status | text | нет | `'processing'` | processing/succeeded/failed/conflict |
+| entity_type | text | да | — | Result kind |
+| entity_id | uuid | да | — | Result id |
+| result | jsonb | да | — | Stable response |
+| error_code | text | да | — | Stable error |
+| started_at | timestamptz | нет | now() | Start |
+| completed_at | timestamptz | да | — | End |
+
+Повтор с тем же hash возвращает result; другой hash получает `idempotency_key_reused`. Registration и business writes — одна transaction.
+
+## 61. Transactional outbox
+
+### `outbox_events`
+
+**Контракт:** infrastructure append-only delivery ledger. Insert только в business transaction; worker update delivery metadata only; delete/partition retention after delivered; RLS browser none, owner diagnostic via safe view; reversal не применим, correction publishes new event.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Event |
+| organization_id | uuid | нет | — | Tenant |
+| aggregate_type | text | нет | — | Aggregate |
+| aggregate_id | uuid | нет | — | Entity |
+| event_type | text | нет | — | Event |
+| event_version | integer | нет | `1` | Schema |
+| payload | jsonb | нет | — | Event data |
+| correlation_id | uuid | нет | — | Command |
+| status | text | нет | `'pending'` | pending/processing/delivered/failed |
+| attempts | integer | нет | `0` | Retry |
+| available_at | timestamptz | нет | now() | Delivery time |
+| delivered_at | timestamptz | да | — | Delivered |
+| created_at | timestamptz | нет | now() | Created |
+
+Indexes pending `(status,available_at,created_at)` with partial predicate and aggregate history. Reconciliation finds terminal commands without expected events.
+
+## 62. Audit events
+
+### `audit_events`
+
+**Контракт:** Audit append-only security/business log. Insert within critical command; browser insert/update/delete forbidden; RLS owner by tenant, support only grant and own actions; partition retention, no reversal; offline operation linked after sync.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Audit |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | да | — | Scope |
+| actor_membership_id | uuid | да | — | Actor |
+| actor_profile_id | uuid | да | — | Support/system actor |
+| device_id | uuid | да | — | Device |
+| command_id | uuid | да | — | Command |
+| local_operation_id | uuid | да | — | Offline id |
+| action | text | нет | — | Action code |
+| entity_type | text | нет | — | Entity |
+| entity_id | uuid | да | — | Entity id |
+| before_data | jsonb | да | — | Redacted before |
+| after_data | jsonb | да | — | Redacted after |
+| reason | text | да | — | Reason |
+| approval_request_id | uuid | да | — | Approval |
+| correlation_id | uuid | нет | — | Trace |
+| created_at | timestamptz | нет | now() | Server time |
+
+Indexes tenant/entity/date, actor/date, local operation. Reconciliation checks every critical command has audit.
+
+## 63. Notifications
+
+### `notifications`
+
+**Контракт:** Notifications; user inbox generated from outbox. RLS recipient/owner; insert worker only; update read/dismiss state only recipient; hard delete after retention allowed for nonfinancial content; no offline command, pull projection.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Notification |
+| organization_id | uuid | нет | — | Tenant |
+| recipient_membership_id | uuid | нет | — | Recipient |
+| notification_type | text | нет | — | Type |
+| title_key | text | нет | — | i18n key |
+| body_data | jsonb | нет | `'{}'` | Translation params |
+| entity_type | text | да | — | Related |
+| entity_id | uuid | да | — | Related id |
+| status | text | нет | `'unread'` | unread/read/dismissed |
+| deduplication_key | text | да | — | Idempotency |
+| read_at | timestamptz | да | — | Read |
+| created_at | timestamptz | нет | now() | Created |
+
+Unique recipient/dedup key where set; index unread inbox.
+
+## 64. Reports и projection tables
+
+### `report_daily_sales`
+
+**Контракт:** Reports rebuildable projection. RLS tenant/branch report permission; worker upsert; browser read only; delete/truncate allowed rebuild; no archive/outbox; not offline Core Pilot.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | нет | — | Branch |
+| business_date | date | нет | — | Date |
+| currency_code | char(3) | нет | — | Currency |
+| sales_amount | numeric(18,4) | нет | `0` | Sales |
+| payments_amount | numeric(18,4) | нет | `0` | Cashflow |
+| debt_amount | numeric(18,4) | нет | `0` | New debt |
+| cost_amount | numeric(18,4) | нет | `0` | Cost |
+| sale_count | bigint | нет | `0` | Count |
+| source_cursor | bigint | нет | — | Projection cutoff |
+| updated_at | timestamptz | нет | now() | Updated |
+
+PK `(organization_id,branch_id,business_date,currency_code)`.
+
+### `report_stock_snapshot`
+
+**Контракт:** Reports rebuildable daily stock snapshot. RLS warehouse report permission; worker insert/upsert; browser read; delete rebuild allowed.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| organization_id | uuid | нет | — | Tenant |
+| warehouse_id | uuid | нет | — | Warehouse |
+| product_id | uuid | нет | — | Product |
+| snapshot_date | date | нет | — | Date |
+| on_hand_quantity | numeric(18,6) | нет | — | Quantity |
+| inventory_value | numeric(18,4) | нет | — | Valuation |
+| source_cursor | bigint | нет | — | Cutoff |
+| created_at | timestamptz | нет | now() | Created |
+
+PK `(warehouse_id,product_id,snapshot_date)`. Reconciliation compares source cursor and ledger.
+
+## 65. Migration exceptions
+
+### `migration_exceptions`
+
+**Контракт:** migration tooling; unresolved V1→V2 issue. RLS service migration role and owner-safe summary, browser writes none; insert/update migration/reconciliation tools; delete only resolved after retention; no offline/outbox.
+
+| Поле | PostgreSQL type | Null | Default | Назначение |
+| --- | --- | --- | --- | --- |
+| id | uuid | нет | gen_random_uuid() | Exception |
+| organization_id | uuid | да | — | Tenant if known |
+| migration_name | text | нет | — | Migration |
+| legacy_table | text | нет | — | Source |
+| legacy_id | text | да | — | Source key |
+| error_code | text | нет | — | Stable issue |
+| details | jsonb | нет | `'{}'` | Evidence |
+| status | text | нет | `'open'` | open/resolved/accepted |
+| resolution | text | да | — | Decision |
+| resolved_at | timestamptz | да | — | Time |
+| created_at | timestamptz | нет | now() | Created |
+
+Unique migration/table/id/error. Index open exceptions.
+
+## 66. Архивирование и retention
+
+- reference/master data: `archived_at`, no hard delete after reference;
+- drafts with no ledger references: physical delete allowed by owning module;
+- posted financial/stock documents and ledgers: hard delete permanently forbidden;
+- audit/outbox/sync/fiscal attempts: time partitioning and documented retention, deletion only privileged maintenance after legal period;
+- projections: rebuildable and physically replaceable;
+- Storage objects: archive metadata before retention cleanup;
+- auth/access records: deactivate/revoke, retain evidence;
+- retention jobs produce technical log and never bypass tenant/legal hold.
+
+## 67. RLS-архитектура
+
+Коды: `S` select, `I` insert, `U` update, `D` delete. `C` означает только server command/RPC. Любое право требует active profile, active membership, совпадающий tenant и, для branch-owned данных, `branch_access`. Service admin дополнительно требует действующий ограниченный `support_access_grant`; все его действия попадают в Audit.
+
+| Таблица или группа | Owner | Seller | Service admin | Anonymous |
+| --- | --- | --- | --- | --- |
+| organizations/settings | S,U | S | S,U по grant | — |
+| user_profiles/memberships | S,I,U | S self | S,U по grant | — |
+| permissions/profiles/access | S,I,U,D config | S own | S,U по grant | — |
+| approval_requests | S,I,U decision | S,I own | S,U по grant | — |
+| branches/warehouses/registers/devices | S,I,U | S assigned | S,U по grant | — |
+| catalog references/products | S,I,U | S | S,I,U по grant | — |
+| prices/recommendations/history | S,C | S current | S,C по grant | — |
+| counterparties/contacts | S,I,U | S,I limited | S,I,U по grant | — |
+| purchase drafts | S,I,U,D draft | S only by permission | S,I,U по grant | — |
+| posted purchases/batches | S,C | S limited | S,C по grant | — |
+| inventory documents/ledgers | S,C | S projection | S,C по grant | — |
+| inventory_balances | S | S assigned | S по grant | — |
+| sale drafts/held sales | S,I,U,D own | S,I,U,D own | S по grant | — |
+| posted sales/returns | S,C | S,C own branch/shift | S,C по grant | — |
+| payments/cash movements | S,C | S,C own shift | S,C по grant | — |
+| receivables/debt payments | S,C | S,C by permission | S,C по grant | — |
+| settlements/acts | S,C | S limited | S,C по grant | — |
+| shifts/totals | S,C | S,C own register | S,C по grant | — |
+| fiscal documents | S,C | S own shift | S,C по grant | — |
+| sync_commands/command results | S own tenant | S own device | S по grant | — |
+| outbox/technical attempts | diagnostic view | — | S по grant | — |
+| audit_events | S | S own limited | S own/grant | — |
+| notifications | S,U own | S,U own | S,U own | — |
+| report projections | S | S permitted subset | S по grant | — |
+| migration_exceptions | safe summary | — | S по grant | — |
+
+Browser напрямую читает только безопасные reference/projection данные. Финансовые и складские документы создаются через команды. Прямой `I/U/D` ledger tables для `authenticated` отсутствует.
+
+Helper functions с `security definer`, фиксированным `search_path=''` и минимальным execute grant:
+
+- `current_profile_id()`;
+- `current_membership_id(organization_id)`;
+- `has_permission(organization_id, permission_code, branch_id)`;
+- `can_access_branch(branch_id)`;
+- `can_access_warehouse(warehouse_id)`;
+- `has_support_grant(organization_id, scope)`.
+
+## 68. Индексы
+
+Индекс создаётся под конкретный запрос:
+
+| Таблица | Индекс | Ускоряемый запрос |
+| --- | --- | --- |
+| memberships | `(user_profile_id,status)` | Tenant list after login |
+| branch_access | `(membership_id,branch_id)` | Branch authorization |
+| products | `(organization_id,status,name)` + trigram name | Active catalog search |
+| product_barcodes | unique `(organization_id,normalized_barcode)` | POS barcode lookup |
+| product_prices | `(price_list_id,product_id,valid_from desc)` | Current price |
+| purchase_documents | `(branch_id,business_date desc,status)` | Purchase journal |
+| product_batches | `(warehouse_id,product_id,expiration_date)` where open | FEFO allocation |
+| inventory_movements | `(warehouse_id,product_id,batch_id,created_at,id)` | Ledger/reconciliation |
+| inventory_balances | unique warehouse/product/batch | Stock lookup and lock |
+| sales | `(register_id,business_date desc,status)` | Register sales |
+| sales | `(customer_counterparty_id,posted_at desc)` | Customer history |
+| payments | `(shift_id,method,created_at)` | Shift totals |
+| receivables | `(counterparty_id,status,due_date)` | Debt book and overdue |
+| settlement_entries | `(counterparty_id,business_date,id)` | Counterparty ledger |
+| shifts | `(register_id,status,opened_at desc)` | Active/history |
+| sync_commands | `(status,received_at)` partial pending | Sync worker queue |
+| command_log | unique operation scope | Idempotency lookup |
+| outbox_events | `(status,available_at,created_at)` partial pending | Outbox worker |
+| audit_events | `(organization_id,entity_type,entity_id,created_at desc)` | Audit investigation |
+| notifications | `(recipient_membership_id,status,created_at desc)` | Unread inbox |
+| reports | PK scope/date | Dashboard range query |
+
+FK columns receive indexes when parent delete/reconciliation or joins use them. Не добавляются дубли PK/unique indexes. Индексы проверяются `EXPLAIN (ANALYZE, BUFFERS)` на pilot volume.
+
+## 69. Уникальные ограничения
+
+- barcode уникален в organization;
+- SKU уникален среди неархивных products;
+- один active primary barcode на product;
+- один primary warehouse на branch;
+- register code уникален в branch и имеет ровно один default warehouse;
+- одна open shift на register в Core Pilot;
+- document number уникален в tenant и типе документа;
+- одна confirmed price на product/price list/moment через exclusion constraint;
+- одна receivable на sale;
+- local operation уникальна по tenant/device;
+- source document/role уникален в каждом ledger;
+- один settlement act на period;
+- один active role code на counterparty;
+- один active support grant scope может быть нормализован отдельной проверкой.
+
+## 70. Check constraints
+
+Checks обеспечивают nonblank codes/names, allowed statuses, nonnegative amounts where unsigned, nonzero signed ledgers, positive quantity/factor, `available=on_hand-reserved`, date ranges, status/timestamp coherence, total formulas и source XOR.
+
+### Стратегия статусов
+
+Новые статусы используют `text + check`, потому что lifecycle принадлежит модулю и будет эволюционировать по migrations. Справочная таблица нужна только для пользовательски настраиваемых видов/причин. PostgreSQL enum не вводится для V2 lifecycle; существующие V1 enum остаются compatibility до backfill.
+
+| Объект | Допустимые статусы |
+| --- | --- |
+| Purchase document | draft, posted, reversed, cancelled |
+| Inventory document | draft, posted, reversed, cancelled |
+| Sale | posted, reversed, partially_returned, returned |
+| Sale return | posted, reversed |
+| Payment | pending, confirmed, failed, reversed |
+| Receivable | open, partial, paid, written_off, reversed |
+| Shift | open, closing, closed |
+| Sync command | received, processing, accepted, rejected, conflict |
+| Approval request | pending, approved, rejected, expired |
+| Fiscal document | pending, processing, issued, deferred, failed, cancelled |
+| Settlement period | open, closed, corrected |
+| Notification | unread, read, dismissed |
+
+### Обеспечение обязательных бизнес-правил
+
+| № | Правило | Механизм PostgreSQL и приложения |
+| --- | --- | --- |
+| 1 | Barcode unique per organization | Unique index normalized barcode |
+| 2 | Archived product not in new doc | FK + posting function status check under lock |
+| 3 | No direct product stock update | Поля остатка нет; grants/RLS |
+| 4 | Stock only movements | Posting functions + projection reconciliation |
+| 5 | Posted document no hard delete | FK restrict, grants, defensive trigger |
+| 6 | Correction by reversal | Function creates linked opposite document/movements |
+| 7 | Repeated local operation no duplicate | Unique key + command_log transaction |
+| 8 | Atomic sale graph | `post_sale` single transaction |
+| 9 | Atomic purchase graph | `post_purchase` single transaction |
+| 10 | Mixed payment is rows | Method check excludes mixed; multiple payment rows |
+| 11 | Payments + debt = sale total | Function calculation + deferred constraint trigger/reconciliation |
+| 12 | Allocation not above receivable | Row lock + function check + receivable check |
+| 13 | Return reduces only unpaid debt | Function computes outstanding line allocation |
+| 14 | Closed shift immutable | Function/grants + defensive trigger |
+| 15 | One confirmed active price | Exclusion constraint on validity range |
+| 16 | Batch purchase cost not sale price | Separate tables/FK ownership |
+| 17 | One primary warehouse | Partial unique index |
+| 18 | Register one default warehouse | NOT NULL FK + tenant/branch validation trigger |
+| 19 | Closed settlement immutable | Function/grants + trigger |
+| 20 | No foreign tenant access | RLS + composite tenant checks |
+| 21 | No hidden service access | Expiring support grant + RLS + audit |
+| 22 | Critical command audit | Transaction inserts audit; reconciliation checks absence |
+| 23 | No JS float money | numeric + decimal string API contract |
+| 24 | Sync metadata on documents | NOT NULL for sync-capable command; unique operation key |
+| 25 | No hard delete finance/stock | Grants, FK restrict, defensive trigger, retention policy |
+
+Критические правила не зависят только от UI. Application validation улучшает сообщения, но server function повторяет проверки.
+
+### Append-only ledgers
+
+| Ledger | Update | Delete | Reversal/исправление | Projection и reconciliation |
+| --- | --- | --- | --- | --- |
+| inventory_movements | Нет | Нет | Opposite movement | inventory_balances vs sum delta |
+| settlement_entries | Нет | Нет | Opposite entry | Counterparty running balance |
+| cash_movements | Нет | Нет | Opposite cash row | shift_totals vs sum delta |
+| debt_allocations | Нет | Нет | Opposite allocation | receivable outstanding |
+| audit_events | Нет | Только retention partition | Новое corrective audit event | Critical command coverage |
+| price_history | Нет | Нет | Новая confirmed version | Current price vs latest history |
+| outbox_events | Только delivery metadata | После retention | Новое compensating event | Terminal command event coverage |
+
+## 71. Foreign keys и правила удаления
+
+- `restrict` для posted documents, lines, ledgers, batches, payments, debts, settlements, shifts, audit source references;
+- `cascade` допустим только для чистой конфигурационной связи до business references, например profile-permission join;
+- `set null` допустим для необязательного display metadata, но не для source document;
+- tenant consistency обеспечивается составными unique/FK либо validated constraint trigger;
+- polymorphic source references дополнительно проверяются posting function и command-specific unique constraint;
+- profile/auth identity не удаляется при наличии audit; профиль деактивируется;
+- legacy `on delete cascade` не переносится в V2 financial model.
+
+## 72. Транзакционные PostgreSQL-команды
+
+Все functions возвращают JSON:
+
+```json
+{
+  "ok": true,
+  "command_id": "uuid",
+  "entity_type": "sale",
+  "entity_id": "uuid",
+  "status": "posted",
+  "version": 1
+}
+```
+
+Общий envelope payload: `schema_version`, `entity_id`, `organization_id`, optional `branch_id`, `device_id`, `local_operation_id`, `client_created_at`, domain data. Actor определяется из `auth.uid()`, membership — сервером. Функция регистрирует command, проверяет RLS-equivalent permission, locks rows в детерминированном порядке, пишет domain data/audit/outbox и result до commit.
+
+| Function | Payload и обязательные id | Права и locks | Порядок записей и транзакция | Результат, errors, audit/outbox, repeat |
+| --- | --- | --- | --- | --- |
+| `create_or_update_product` | product fields, org, optional version | catalog.manage; lock product/references | validate same tenant, insert/update product/barcodes/images, audit/outbox | product/version; invalid_reference, duplicate_identifier, version_conflict; repeat same result |
+| `confirm_price_change` | request, amount, valid_from, org | pricing.confirm; lock request/current price | close old interval, insert price/history, resolve request, audit/outbox | price id; overlap, request_closed; repeat result |
+| `post_purchase` | header, lines, costs, org/branch/device/op | purchases.post; lock command, products, balances | purchase/lines, allocations, batches, movements/balances, settlement, recommendation, audit/outbox | purchase id; inactive_product, invalid_total, stock_conflict; atomic/repeat |
+| `reverse_purchase` | original id, reason, context/op | purchases.reverse + approval; lock original/balances | reversal header/lines, opposite movements/settlement, audit/outbox | reversal id; already_reversed, insufficient_stock |
+| `post_inventory_adjustment` | warehouse, lines, reason, approval/op | inventory.adjust; lock balances | document/lines, movements, balances, audit/outbox | document id; approval_required, negative_stock |
+| `post_warehouse_transfer` | source/destination, lines/op | inventory.transfer; access both; lock warehouses/balances UUID order | transfer/lines, paired movements, both projections, audit/outbox | transfer id; same_warehouse, insufficient_stock |
+| `open_shift` | register, opening cash, context/op | shifts.open; lock register/open shift key | shift, opening cash movement if needed, totals, audit/outbox | shift id; shift_already_open, device_not_assigned |
+| `post_sale` | sale/lines/payment rows/debt, context/op | sales.post, discount/debt limits; lock shift/prices/balances/customer | command, sale/lines, movements/balances, payments/cash, receivable, audit/outbox | sale id; shift_closed, price_conflict, limit_exceeded, insufficient_stock |
+| `post_sale_return` | original sale/line quantities/refund methods/op | sales.return; lock sale, prior returns, debt, balances, shift | return/lines, stock movements, refund payments, debt allocation, audit/outbox | return id; return_exceeds_sale, debt_allocation_conflict |
+| `cancel_or_reverse_sale` | sale, reason, approval/op | sales.reverse; lock full sale graph | reversal sale, opposite stock/payment/debt/cash, audit/outbox | reversal id; already_reversed, fiscal_reversal_required |
+| `record_debt_payment` | customer, allocations, payment rows, shift/op | debts.collect; lock shift/receivables due order | debt payment, payments/cash, allocations, receivable projections, audit/outbox | payment id; over_allocation, currency_mismatch |
+| `post_daily_delivery` | template, date, purchase lines/context/op | purchases.post_daily; purchase locks | daily doc plus exact `post_purchase` graph | daily/purchase ids; same purchase errors; repeat stable |
+| `record_counterparty_goods_taken` | party, sale/inventory lines, settlement/op | settlements.goods_taken + sales/stock; locks balances/party | source document, stock movements, settlement entry, audit/outbox | document id; insufficient_stock, closed_period |
+| `close_settlement_period` | party, range, currency/context/op | settlements.close; lock party/open entries/period | period, attach entries, act/lines/hash, audit/outbox | act id/balance; overlapping_period, unposted_source |
+| `record_cash_movement` | shift, type, amount, reason/context/op | cash.move and optional approval; lock open shift | cash row, shift total, audit/outbox | movement id; shift_closed, approval_required |
+| `close_shift` | shift, actual totals/context/op | shifts.close; lock shift/payments/cash/sync pending | reconcile totals, close/freeze, discrepancy audit/outbox | shift summary; pending_sync, totals_mismatch, already_closed |
+| `submit_sync_command` | envelope with device/op/type/payload | active device/membership; lock idempotency key | insert sync row, dispatch domain function in transaction/savepoint policy, persist result | accepted/rejected/conflict/duplicate; same result on retry |
+| `resolve_sync_conflict` | conflict id, resolution command/context/op | sync.resolve + domain permission; lock conflict | close conflict, execute new command, audit/outbox | new command result; conflict_closed, stale_resolution |
+
+Внешние HTTP-вызовы не происходят внутри functions. Expected error codes возвращаются как стабильный code; unexpected errors rollback transaction.
+
+```mermaid
+sequenceDiagram
+  participant Client as PWA
+  participant Sync as submit_sync_command
+  participant Log as command_log
+  participant Domain as Domain RPC
+  participant DB as PostgreSQL
+
+  Client->>Sync: device_id, local_operation_id, payload
+  Sync->>Log: Insert idempotency key and hash
+  alt Existing same hash
+    Log-->>Client: Stored stable result
+  else Existing different hash
+    Log-->>Client: idempotency_key_reused
+  else New command
+    Sync->>Domain: Execute with actor context
+    Domain->>DB: Domain rows, ledgers, projections, audit, outbox
+    DB-->>Log: Persist result in same transaction
+    Log-->>Client: accepted, rejected, or conflict
+  end
+```
+
+```mermaid
+erDiagram
+  PURCHASE_DOCUMENTS ||--|{ PURCHASE_LINES : contains
+  PURCHASE_DOCUMENTS ||--o{ PURCHASE_ADDITIONAL_COSTS : has
+  PURCHASE_ADDITIONAL_COSTS ||--o{ PURCHASE_COST_ALLOCATIONS : allocates
+  PURCHASE_LINES ||--o{ PURCHASE_COST_ALLOCATIONS : receives
+  PURCHASE_LINES ||--o{ PRODUCT_BATCHES : creates
+  PRODUCT_BATCHES ||--o{ INVENTORY_MOVEMENTS : moves
+  INVENTORY_DOCUMENTS ||--|{ INVENTORY_DOCUMENT_LINES : contains
+  INVENTORY_DOCUMENT_LINES ||--o{ INVENTORY_MOVEMENTS : posts
+  WAREHOUSES ||--o{ INVENTORY_BALANCES : projects
+  INVENTORY_MOVEMENTS }o--|| INVENTORY_BALANCES : updates
+  INVENTORY_COUNTS ||--|{ INVENTORY_COUNT_LINES : contains
+  WAREHOUSE_TRANSFERS ||--|{ WAREHOUSE_TRANSFER_LINES : contains
+```
+
+## 73. Миграция V1 → V2
+
+Expand-and-contract, idempotent backfill, checkpoints и no rewrite старых migrations.
+
+| V1 | V2 | Способ переноса | Проверка |
+| --- | --- | --- | --- |
+| organizations | organizations/settings | Сохранить UUID, заполнить UZS/timezone | Counts/status |
+| stores | branches | Один branch, legacy_store_id | 1:1 mapping |
+| stores | primary warehouses | Один primary warehouse | Exactly one per branch |
+| stores | registers | Одна register с default warehouse | 1:1 and FK |
+| users | user_profiles | Auth mapping, убрать password hash | Unique non-null auth id exceptions |
+| users | memberships | Org + role/status | One active membership |
+| user_store_access | branch_access | Через store→branch mapping | Count and tenant |
+| categories | categories | Preserve IDs/hierarchy/archive | No cycles/orphans |
+| products | products | Preserve IDs, map refs/base unit | Required unit, no stock/price semantics |
+| products.barcode | product_barcodes | Primary barcode row | Duplicate report |
+| products.sale_price | initial product_prices/history | Initial confirmed version | One active price/product |
+| products.current_quantity | opening inventory documents | Opening delta in primary warehouse | Ledger sum equals legacy |
+| suppliers | counterparties/roles | Supplier role, mapping table | Counts and normalized duplicates |
+| customers | counterparties/roles/credit | Customer role; no unsafe auto-merge | Debt/customer linkage |
+| product_batches | synthetic purchase documents/lines/batches | Group deterministically by store/date/supplier | Quantity/cost totals |
+| stock_movements | migrated inventory movements | Link synthetic source or exception | Movement sums |
+| sales | sales | Preserve ids, map register/warehouse/shift | Header totals |
+| sale_items | sale_lines | Snapshot names/unit/cost | Sum lines |
+| payments | payments | Map methods; split invalid mixed to exception | Payments totals |
+| debt_entries | receivables/allocations | Reconstruct sale debt ledger | Outstanding reconciliation |
+| debt_payments | debt_payments/payments/allocations | Preserve operation ids | Customer totals |
+| shifts | shifts/totals | Store→register; recompute totals | Status and money |
+| devices | devices | Store→branch/register | Unique fingerprint fallback |
+| sync_operations | sync_commands/command_log | Preserve local id and payload hash | Duplicate/conflict report |
+| operation_logs | audit_events | Map actor/entity/data | Count and timestamp |
+
+Неоднозначные supplier/customer merges, nullable auth ids, mixed payments, orphan batches и inconsistent totals попадают в `migration_exceptions`.
+
+```mermaid
+flowchart LR
+  Snapshot["Backup и V1 snapshot"]
+  Foundation["Создать V2 foundation"]
+  Locations["stores в branches, warehouses, registers"]
+  Catalog["Catalog и pricing backfill"]
+  Parties["Suppliers и customers в counterparties"]
+  Ledgers["Synthetic documents и ledgers"]
+  Shadow["Shadow reads и reconciliation"]
+  Switch["Feature flag: V2 writer"]
+  Contract["Freeze legacy и future contract"]
+
+  Snapshot --> Foundation --> Locations --> Catalog --> Parties --> Ledgers
+  Ledgers --> Shadow
+  Shadow -->|"Все checks прошли"| Switch
+  Shadow -->|"Exceptions"| Ledgers
+  Switch --> Contract
+```
+
+## 74. Проверка и сверка данных
+
+До применения: backup/restore check, duplicate IDs/barcodes/auth ids, orphan FK, enum distributions, negative quantities, totals, local operation duplicates.
+
+После каждого backfill:
+
+- row counts и mapping coverage;
+- sum inventory movements = opening/current expected;
+- batch quantities do not exceed opening;
+- sale lines = sale totals;
+- payments + receivable = sale total;
+- receivable original − allocations = outstanding;
+- settlement act hash/lines = period entries;
+- shifts totals = payments/cash movements;
+- one active price and primary warehouse;
+- critical commands have audit/outbox;
+- cross-tenant FK query returns zero;
+- migration exceptions classified and approved.
+
+Reconciliation jobs пишут result/cutoff, но не исправляют ledgers автоматически.
+
+## 75. Порядок будущих migrations
+
+Файлы предлагаются, но на этом этапе не создаются.
+
+| Migration | Ответственность и таблицы | Legacy changes | Dependencies / compatibility | Pre/post checks и forward recovery |
+| --- | --- | --- | --- | --- |
+| `0007_v2_foundation.sql` | command_log, outbox, audit, migration exceptions, helpers | Нет | 0001–0006; additive | Extensions/types/grants; fix forward new migration |
+| `0008_v2_identity_access.sql` | profiles, memberships, permissions, approvals, support grants | Add mapping refs only | 0007; V1 users continue | Auth duplicate scan; membership coverage |
+| `0009_v2_locations.sql` | settings, branches, warehouses, registers, devices V2 | stores untouched | 0008 | Store mapping dry run; one primary/default |
+| `0010_v2_catalog_compatibility.sql` | barcodes/images/conversions, compatibility views | Add nullable mapping columns if needed | 0009 | Duplicate barcode; old UI reads preserved |
+| `0011_v2_pricing.sql` | price lists/prices/requests/recommendations/history | products.sale_price retained | 0010 | One initial price; shadow compare |
+| `0012_v2_counterparties.sql` | parties/roles/contacts/addresses/credit | supplier/customer untouched | 0008 | Duplicate candidates/exceptions |
+| `0013_v2_purchases_inventory.sql` | purchase/inventory documents, batches V2, ledgers/balances | No destructive changes | 0010–0012 | Synthetic doc rehearsal; stock reconciliation |
+| `0014_v2_sales_payments.sql` | sales/lines/returns/held/payments/fiscal | V1 sales retained | 0011,0013 | Total/payment/stock tests |
+| `0015_v2_debts_settlements.sql` | receivables/allocations/settlement tables | V1 debts retained | 0012,0014 | Debt and party ledger reconciliation |
+| `0016_v2_shifts_cash.sql` | shifts/totals/cash ledger | V1 shifts retained | 0014 | Open shift conflicts/totals |
+| `0017_v2_sync_audit_outbox.sql` | sync commands, final event plumbing | sync_operations retained | all domain commands stable | Retry/idempotency/outbox tests |
+| `0018_v2_rls.sql` | RLS helpers, policies, grants, defensive triggers | Revoke unsafe V2 grants only | tables/backfill helpers | Role matrix and cross-tenant test suite |
+| `0019_v2_backfill.sql` | idempotent backfill procedures/checkpoints | Reads V1, writes V2 | 0007–0018 | Dry run, exceptions, restartability |
+| `0020_v2_reconciliation.sql` | reconciliation views/functions/reports | Legacy frozen after acceptance | 0019 | Zero critical mismatch before feature flag |
+
+Forward recovery создаёт следующую migration; уже применённые файлы не переписываются. Destructive contract migration не входит в этот список и возможна после pilot retention.
+
+## 76. Риски модели данных
+
+| Риск | Последствие | Снижение |
+| --- | --- | --- |
+| 74 таблицы создаются big-bang | Долгий непроверяемый rollout | Миграции 0007–0020 и vertical slices |
+| Polymorphic source FK слабее обычного FK | Orphan ledger source | Command-only insert, source unique, reconciliation |
+| RLS helper recursion/performance | Leak или latency | Security-definer helpers, indexes, role tests |
+| Projection расходится с ledger | Неверный POS остаток | Same transaction update, version, scheduled rebuild |
+| V1 quantities/batches расходятся | Неверный opening stock | Exceptions и approved opening document |
+| Counterparty auto-merge ошибается | Чужой долг/баланс | Conservative mapping, manual review |
+| Decimal serialization нарушена | Денежные ошибки | Decimal string contract и property tests |
+| Closed-period late offline command | Неясный settlement | Conflict, new correction period, audit |
+| Offline oversell | Negative stock | Locks online, offline policy, owner exception report |
+| Retention удаляет evidence | Нарушение аудита | Legal holds, partition policy, restore drill |
+
+## 77. Критерии готовности database design
+
+Design готов к migration implementation, когда:
+
+1. все таблицы имеют владельца и не дублируют ledger/projection ответственность;
+2. 25 обязательных правил имеют database/server механизм;
+3. контракты 18 commands согласованы с UI и offline envelope;
+4. money/quantity/rounding contract утверждён;
+5. RLS matrix и support grant threat model одобрены;
+6. transaction graphs sale/purchase/debt/shift определены;
+7. no hard delete для posted finance/stock подтверждён grants/FK/trigger plan;
+8. V1 mapping имеет dry run и exception policy;
+9. migration sequence проверена на пустой и копии production-like базы;
+10. индексы связаны с запросами и имеют план EXPLAIN;
+11. Mermaid ER и lifecycle diagrams проходят структурную проверку;
+12. PRODUCT_SPEC_V2 и ARCHITECTURE_V2 traceability не содержит потерянных правил;
+13. согласован Core Pilot scope: один primary warehouse на branch при расширяемой модели;
+14. следующий шаг ограничен проектированием `0007_v2_foundation.sql`, без изменения старых migrations.
