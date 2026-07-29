@@ -575,6 +575,99 @@ begin
 end;
 $$;
 
+create or replace function public.v2_guard_user_profile_update()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if new.id is distinct from old.id
+    or new.auth_user_id is distinct from old.auth_user_id
+    or new.created_at is distinct from old.created_at
+  then
+    raise exception using
+      errcode = 'P0001',
+      message = 'V2_USER_PROFILE_IDENTITY_MUTATION_FORBIDDEN';
+  end if;
+
+  return new;
+end;
+$$;
+
+create or replace function public.v2_guard_membership_update()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if new.id is distinct from old.id
+    or new.organization_id is distinct from old.organization_id
+    or new.user_profile_id is distinct from old.user_profile_id
+    or new.created_at is distinct from old.created_at
+  then
+    raise exception using
+      errcode = 'P0001',
+      message = 'V2_MEMBERSHIP_IDENTITY_MUTATION_FORBIDDEN';
+  end if;
+
+  return new;
+end;
+$$;
+
+create or replace function public.v2_guard_permission_profile_update()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if new.id is distinct from old.id
+    or new.organization_id is distinct from old.organization_id
+    or new.is_system is distinct from old.is_system
+    or new.code is distinct from old.code
+    or new.created_at is distinct from old.created_at
+  then
+    raise exception using
+      errcode = 'P0001',
+      message = 'V2_PERMISSION_PROFILE_SCOPE_MUTATION_FORBIDDEN';
+  end if;
+
+  return new;
+end;
+$$;
+
+create or replace function public.v2_guard_permission_assignment_update()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  raise exception using
+    errcode = 'P0001',
+    message = 'V2_PERMISSION_ASSIGNMENT_UPDATE_FORBIDDEN';
+end;
+$$;
+
+create or replace function public.v2_guard_branch_access_update()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if new.id is distinct from old.id
+    or new.organization_id is distinct from old.organization_id
+    or new.membership_id is distinct from old.membership_id
+    or new.branch_id is distinct from old.branch_id
+    or new.created_at is distinct from old.created_at
+  then
+    raise exception using
+      errcode = 'P0001',
+      message = 'V2_BRANCH_ACCESS_IDENTITY_MUTATION_FORBIDDEN';
+  end if;
+
+  return new;
+end;
+$$;
+
 create or replace function public.v2_validate_membership_inviter()
 returns trigger
 language plpgsql
@@ -929,6 +1022,16 @@ create trigger v2_permission_profiles_updated_at
 before update on public.permission_profiles
 for each row execute function public.set_updated_at();
 
+create trigger v2_user_profiles_identity_guard
+before update on public.user_profiles
+for each row execute function public.v2_guard_user_profile_update();
+create trigger v2_memberships_identity_guard
+before update on public.organization_memberships
+for each row execute function public.v2_guard_membership_update();
+create trigger v2_permission_profiles_scope_guard
+before update on public.permission_profiles
+for each row execute function public.v2_guard_permission_profile_update();
+
 create trigger v2_memberships_inviter_validate_insert
 before insert on public.organization_memberships
 for each row execute function public.v2_validate_membership_inviter();
@@ -960,10 +1063,16 @@ for each row execute function public.v2_guard_permission_mutation();
 create trigger v2_permissions_prevent_delete
 before delete on public.permissions
 for each row execute function public.v2_guard_permission_mutation();
+create trigger v2_permissions_prevent_insert
+before insert on public.permissions
+for each row execute function public.v2_guard_permission_mutation();
 
 create trigger v2_profile_assignment_validate
 before insert on public.membership_permission_profiles
 for each row execute function public.v2_validate_profile_assignment();
+create trigger v2_profile_assignment_prevent_update
+before update on public.membership_permission_profiles
+for each row execute function public.v2_guard_permission_assignment_update();
 create trigger v2_profile_assignment_bump_insert
 after insert on public.membership_permission_profiles
 for each row execute function public.v2_bump_membership_permission_version();
@@ -977,6 +1086,9 @@ for each row execute function public.v2_validate_branch_access();
 create trigger v2_branch_access_validate_update
 before update on public.branch_access
 for each row execute function public.v2_validate_branch_access();
+create trigger v2_branch_access_identity_guard
+before update on public.branch_access
+for each row execute function public.v2_guard_branch_access_update();
 create trigger v2_branch_access_bump_insert
 after insert on public.branch_access
 for each row execute function public.v2_bump_membership_permission_version();
@@ -1201,6 +1313,16 @@ grant execute on function public.v2_has_support_grant(uuid, text)
 revoke all privileges on function public.v2_prevent_identity_delete()
   from public, anon, authenticated;
 revoke all privileges on function public.v2_guard_permission_mutation()
+  from public, anon, authenticated;
+revoke all privileges on function public.v2_guard_user_profile_update()
+  from public, anon, authenticated;
+revoke all privileges on function public.v2_guard_membership_update()
+  from public, anon, authenticated;
+revoke all privileges on function public.v2_guard_permission_profile_update()
+  from public, anon, authenticated;
+revoke all privileges on function public.v2_guard_permission_assignment_update()
+  from public, anon, authenticated;
+revoke all privileges on function public.v2_guard_branch_access_update()
   from public, anon, authenticated;
 revoke all privileges on function public.v2_validate_membership_inviter()
   from public, anon, authenticated;

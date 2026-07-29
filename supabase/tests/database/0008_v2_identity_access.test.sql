@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = public, extensions;
 
-select plan(165);
+select plan(198);
 
 -- Nine identity and access relations.
 select has_table('public', relation_name, relation_name || ' exists')
@@ -735,6 +735,186 @@ values (
   now() - interval '2 hours', now() - interval '1 hour'
 );
 select ok(not public.v2_has_support_grant('00000000-0000-0000-0000-000000008101', 'sales.view'), 'expired-by-time support grant is denied');
+
+select throws_ok(
+  $$update public.user_profiles
+    set auth_user_id = '00000000-0000-0000-0000-000000008003'
+    where id = '00000000-0000-0000-0000-000000008201'$$,
+  'P0001', 'V2_USER_PROFILE_IDENTITY_MUTATION_FORBIDDEN',
+  'user profile auth identity is immutable'
+);
+select lives_ok(
+  $$update public.user_profiles
+    set full_name = 'Owner A renamed'
+    where id = '00000000-0000-0000-0000-000000008201'$$,
+  'user profile full_name remains mutable'
+);
+select throws_ok(
+  $$update public.organization_memberships
+    set organization_id = '00000000-0000-0000-0000-000000008102'
+    where id = '00000000-0000-0000-0000-000000008302'$$,
+  'P0001', 'V2_MEMBERSHIP_IDENTITY_MUTATION_FORBIDDEN',
+  'membership organization identity is immutable'
+);
+select throws_ok(
+  $$update public.organization_memberships
+    set user_profile_id = '00000000-0000-0000-0000-000000008201'
+    where id = '00000000-0000-0000-0000-000000008302'$$,
+  'P0001', 'V2_MEMBERSHIP_IDENTITY_MUTATION_FORBIDDEN',
+  'membership profile identity is immutable'
+);
+select lives_ok(
+  $$update public.organization_memberships
+    set status = 'blocked'
+    where id = '00000000-0000-0000-0000-000000008305'$$,
+  'membership status remains mutable'
+);
+select lives_ok(
+  $$update public.organization_memberships
+    set invited_by = '00000000-0000-0000-0000-000000008301'
+    where id = '00000000-0000-0000-0000-000000008302'$$,
+  'same-tenant membership inviter update is accepted'
+);
+select throws_ok(
+  $$update public.organization_memberships
+    set invited_by = '00000000-0000-0000-0000-000000008303'
+    where id = '00000000-0000-0000-0000-000000008302'$$,
+  'P0001', 'V2_MEMBERSHIP_INVITER_TENANT_MISMATCH',
+  'cross-tenant membership inviter update is rejected'
+);
+select throws_ok(
+  $$update public.permission_profiles
+    set organization_id = '00000000-0000-0000-0000-000000008102'
+    where id = '00000000-0000-0000-0000-000000008401'$$,
+  'P0001', 'V2_PERMISSION_PROFILE_SCOPE_MUTATION_FORBIDDEN',
+  'permission profile cannot move to another tenant'
+);
+select throws_ok(
+  $$update public.permission_profiles
+    set is_system = true
+    where id = '00000000-0000-0000-0000-000000008401'$$,
+  'P0001', 'V2_PERMISSION_PROFILE_SCOPE_MUTATION_FORBIDDEN',
+  'permission profile system scope is immutable'
+);
+select throws_ok(
+  $$update public.permission_profiles
+    set code = 'tenant_a_changed'
+    where id = '00000000-0000-0000-0000-000000008401'$$,
+  'P0001', 'V2_PERMISSION_PROFILE_SCOPE_MUTATION_FORBIDDEN',
+  'permission profile stable code is immutable'
+);
+select throws_ok(
+  $$update public.membership_permission_profiles
+    set assigned_by = '00000000-0000-0000-0000-000000008302'
+    where membership_id = '00000000-0000-0000-0000-000000008302'
+      and permission_profile_id = '00000000-0000-0000-0000-000000000102'$$,
+  'P0001', 'V2_PERMISSION_ASSIGNMENT_UPDATE_FORBIDDEN',
+  'permission assignment update is forbidden'
+);
+select throws_ok(
+  $$update public.branch_access
+    set branch_id = '00000000-0000-0000-0000-000000008602'
+    where id = '00000000-0000-0000-0000-000000008501'$$,
+  'P0001', 'V2_BRANCH_ACCESS_IDENTITY_MUTATION_FORBIDDEN',
+  'branch access branch identity is immutable'
+);
+select throws_ok(
+  $$update public.branch_access
+    set membership_id = '00000000-0000-0000-0000-000000008301'
+    where id = '00000000-0000-0000-0000-000000008501'$$,
+  'P0001', 'V2_BRANCH_ACCESS_IDENTITY_MUTATION_FORBIDDEN',
+  'branch access membership identity is immutable'
+);
+select throws_ok(
+  $$update public.branch_access
+    set organization_id = '00000000-0000-0000-0000-000000008102'
+    where id = '00000000-0000-0000-0000-000000008501'$$,
+  'P0001', 'V2_BRANCH_ACCESS_IDENTITY_MUTATION_FORBIDDEN',
+  'branch access organization identity is immutable'
+);
+select lives_ok(
+  $$update public.branch_access
+    set is_primary = false
+    where id = '00000000-0000-0000-0000-000000008501'$$,
+  'branch access primary flag remains mutable'
+);
+select is(
+  (select permission_version from public.organization_memberships where id = '00000000-0000-0000-0000-000000008302'),
+  4::bigint,
+  'primary branch update bumps permission_version'
+);
+select throws_ok(
+  $$insert into public.permissions (code, module, description)
+    values ('runtime.forbidden', 'test', 'Must be rejected')$$,
+  'P0001', 'V2_PERMISSION_REGISTRY_MUTATION_FORBIDDEN',
+  'runtime permission insert is forbidden after seed'
+);
+select is(
+  (select count(*) from public.permissions),
+  38::bigint,
+  'runtime guard preserves the exact 38-permission registry'
+);
+
+select ok(
+  not has_function_privilege('public', 'public.v2_guard_user_profile_update()', 'EXECUTE'),
+  'public cannot execute user profile identity guard'
+);
+select ok(
+  not has_function_privilege('anon', 'public.v2_guard_user_profile_update()', 'EXECUTE'),
+  'anon cannot execute user profile identity guard'
+);
+select ok(
+  not has_function_privilege('authenticated', 'public.v2_guard_user_profile_update()', 'EXECUTE'),
+  'authenticated cannot execute user profile identity guard'
+);
+select ok(
+  not has_function_privilege('public', 'public.v2_guard_membership_update()', 'EXECUTE'),
+  'public cannot execute membership identity guard'
+);
+select ok(
+  not has_function_privilege('anon', 'public.v2_guard_membership_update()', 'EXECUTE'),
+  'anon cannot execute membership identity guard'
+);
+select ok(
+  not has_function_privilege('authenticated', 'public.v2_guard_membership_update()', 'EXECUTE'),
+  'authenticated cannot execute membership identity guard'
+);
+select ok(
+  not has_function_privilege('public', 'public.v2_guard_permission_profile_update()', 'EXECUTE'),
+  'public cannot execute permission profile scope guard'
+);
+select ok(
+  not has_function_privilege('anon', 'public.v2_guard_permission_profile_update()', 'EXECUTE'),
+  'anon cannot execute permission profile scope guard'
+);
+select ok(
+  not has_function_privilege('authenticated', 'public.v2_guard_permission_profile_update()', 'EXECUTE'),
+  'authenticated cannot execute permission profile scope guard'
+);
+select ok(
+  not has_function_privilege('public', 'public.v2_guard_permission_assignment_update()', 'EXECUTE'),
+  'public cannot execute permission assignment update guard'
+);
+select ok(
+  not has_function_privilege('anon', 'public.v2_guard_permission_assignment_update()', 'EXECUTE'),
+  'anon cannot execute permission assignment update guard'
+);
+select ok(
+  not has_function_privilege('authenticated', 'public.v2_guard_permission_assignment_update()', 'EXECUTE'),
+  'authenticated cannot execute permission assignment update guard'
+);
+select ok(
+  not has_function_privilege('public', 'public.v2_guard_branch_access_update()', 'EXECUTE'),
+  'public cannot execute branch access identity guard'
+);
+select ok(
+  not has_function_privilege('anon', 'public.v2_guard_branch_access_update()', 'EXECUTE'),
+  'anon cannot execute branch access identity guard'
+);
+select ok(
+  not has_function_privilege('authenticated', 'public.v2_guard_branch_access_update()', 'EXECUTE'),
+  'authenticated cannot execute branch access identity guard'
+);
 
 update public.user_profiles set status = 'blocked' where id = '00000000-0000-0000-0000-000000008202';
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000008002', true);
