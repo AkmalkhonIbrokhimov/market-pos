@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = public, extensions;
 
-select plan(149);
+select plan(165);
 
 -- Nine identity and access relations.
 select has_table('public', relation_name, relation_name || ' exists')
@@ -339,6 +339,30 @@ select throws_ok(
     )$$,
   '23514', null, 'active membership requires joined_at'
 );
+select throws_ok(
+  $$insert into public.organization_memberships
+    (organization_id, user_profile_id, system_role, status, joined_at, invited_by)
+    values (
+      '00000000-0000-0000-0000-000000008102',
+      '00000000-0000-0000-0000-000000008202',
+      'seller', 'active', now(),
+      '00000000-0000-0000-0000-000000008301'
+    )$$,
+  'P0001', 'V2_MEMBERSHIP_INVITER_TENANT_MISMATCH',
+  'membership inviter from another tenant is rejected'
+);
+select lives_ok(
+  $$insert into public.organization_memberships
+    (id, organization_id, user_profile_id, system_role, status, joined_at, invited_by)
+    values (
+      '00000000-0000-0000-0000-000000008305',
+      '00000000-0000-0000-0000-000000008102',
+      '00000000-0000-0000-0000-000000008204',
+      'seller', 'active', now(),
+      '00000000-0000-0000-0000-000000008303'
+    )$$,
+  'membership inviter from the same tenant is accepted'
+);
 
 insert into public.permission_profiles (
   id, organization_id, code, name, is_system
@@ -488,6 +512,149 @@ select throws_ok(
   'P0001', 'V2_TERMINAL_APPROVAL_MUTATION_FORBIDDEN',
   'terminal approval is immutable'
 );
+
+select throws_ok(
+  $$insert into public.command_log (
+      organization_id, actor_membership_id, local_operation_id,
+      command_type, payload_hash
+    )
+    values (
+      '00000000-0000-0000-0000-000000008102',
+      '00000000-0000-0000-0000-000000008301',
+      '00000000-0000-0000-0000-000000008706',
+      'test.cross-actor', 'cross-actor-hash'
+    )$$,
+  'P0001', 'V2_COMMAND_ACTOR_TENANT_MISMATCH',
+  'command actor from another tenant is rejected'
+);
+select lives_ok(
+  $$insert into public.command_log (
+      id, organization_id, actor_membership_id, local_operation_id,
+      command_type, payload_hash
+    )
+    values (
+      '00000000-0000-0000-0000-000000008707',
+      '00000000-0000-0000-0000-000000008102',
+      '00000000-0000-0000-0000-000000008303',
+      '00000000-0000-0000-0000-000000008708',
+      'test.same-actor', 'same-actor-hash'
+    )$$,
+  'command actor from the same tenant is accepted'
+);
+select throws_ok(
+  $$insert into public.approval_requests (
+      organization_id, command_id, permission_code, requested_by,
+      reason, payload_hash, expires_at
+    )
+    values (
+      '00000000-0000-0000-0000-000000008101',
+      '00000000-0000-0000-0000-000000008707',
+      'sales.reverse',
+      '00000000-0000-0000-0000-000000008302',
+      'Cross command', 'cross-command-hash', now() + interval '1 hour'
+    )$$,
+  'P0001', 'V2_APPROVAL_COMMAND_TENANT_MISMATCH',
+  'approval command from another tenant is rejected'
+);
+select lives_ok(
+  $$insert into public.approval_requests (
+      id, organization_id, command_id, permission_code, requested_by,
+      reason, payload_hash, expires_at
+    )
+    values (
+      '00000000-0000-0000-0000-000000008709',
+      '00000000-0000-0000-0000-000000008102',
+      '00000000-0000-0000-0000-000000008707',
+      'sales.reverse',
+      '00000000-0000-0000-0000-000000008303',
+      'Same command', 'same-command-hash', now() + interval '1 hour'
+    )$$,
+  'approval command from the same tenant is accepted'
+);
+
+select throws_ok(
+  $$insert into public.audit_events (
+      organization_id, actor_membership_id, correlation_id,
+      action, entity_type
+    )
+    values (
+      '00000000-0000-0000-0000-000000008101',
+      '00000000-0000-0000-0000-000000008303',
+      '00000000-0000-0000-0000-000000008710',
+      'test.audit.actor', 'test'
+    )$$,
+  'P0001', 'V2_AUDIT_ACTOR_TENANT_MISMATCH',
+  'audit actor from another tenant is rejected'
+);
+select throws_ok(
+  $$insert into public.audit_events (
+      organization_id, command_log_id, correlation_id,
+      action, entity_type
+    )
+    values (
+      '00000000-0000-0000-0000-000000008101',
+      '00000000-0000-0000-0000-000000008707',
+      '00000000-0000-0000-0000-000000008711',
+      'test.audit.command', 'test'
+    )$$,
+  'P0001', 'V2_AUDIT_COMMAND_TENANT_MISMATCH',
+  'audit command from another tenant is rejected'
+);
+select throws_ok(
+  $$insert into public.audit_events (
+      organization_id, approval_request_id, correlation_id,
+      action, entity_type
+    )
+    values (
+      '00000000-0000-0000-0000-000000008101',
+      '00000000-0000-0000-0000-000000008709',
+      '00000000-0000-0000-0000-000000008712',
+      'test.audit.approval', 'test'
+    )$$,
+  'P0001', 'V2_AUDIT_APPROVAL_TENANT_MISMATCH',
+  'audit approval from another tenant is rejected'
+);
+select lives_ok(
+  $$insert into public.audit_events (
+      organization_id, actor_membership_id, command_log_id,
+      approval_request_id, correlation_id, action, entity_type
+    )
+    values (
+      '00000000-0000-0000-0000-000000008102',
+      '00000000-0000-0000-0000-000000008303',
+      '00000000-0000-0000-0000-000000008707',
+      '00000000-0000-0000-0000-000000008709',
+      '00000000-0000-0000-0000-000000008713',
+      'test.audit.same-tenant', 'test'
+    )$$,
+  'all same-tenant audit relations are accepted'
+);
+
+select ok(
+  not has_function_privilege('anon', 'public.v2_validate_membership_inviter()', 'EXECUTE'),
+  'anon cannot execute membership inviter validator'
+);
+select ok(
+  not has_function_privilege('authenticated', 'public.v2_validate_membership_inviter()', 'EXECUTE'),
+  'authenticated cannot execute membership inviter validator'
+);
+select ok(
+  not has_function_privilege('anon', 'public.v2_validate_command_actor_tenant()', 'EXECUTE'),
+  'anon cannot execute command actor validator'
+);
+select ok(
+  not has_function_privilege('authenticated', 'public.v2_validate_command_actor_tenant()', 'EXECUTE'),
+  'authenticated cannot execute command actor validator'
+);
+select ok(
+  not has_function_privilege('anon', 'public.v2_validate_audit_tenant()', 'EXECUTE'),
+  'anon cannot execute audit tenant validator'
+);
+select ok(
+  not has_function_privilege('authenticated', 'public.v2_validate_audit_tenant()', 'EXECUTE'),
+  'authenticated cannot execute audit tenant validator'
+);
+
 insert into public.command_log (
   id, organization_id, local_operation_id, command_type, payload_hash
 )

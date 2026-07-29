@@ -575,6 +575,31 @@ begin
 end;
 $$;
 
+create or replace function public.v2_validate_membership_inviter()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+declare
+  inviter_organization_id uuid;
+begin
+  if new.invited_by is not null then
+    select organization_id
+    into inviter_organization_id
+    from public.organization_memberships
+    where id = new.invited_by;
+
+    if inviter_organization_id is distinct from new.organization_id then
+      raise exception using
+        errcode = 'P0001',
+        message = 'V2_MEMBERSHIP_INVITER_TENANT_MISMATCH';
+    end if;
+  end if;
+
+  return new;
+end;
+$$;
+
 create or replace function public.v2_validate_profile_assignment()
 returns trigger
 language plpgsql
@@ -677,9 +702,21 @@ language plpgsql
 set search_path = ''
 as $$
 declare
+  command_organization_id uuid;
   requester_organization_id uuid;
   approver_organization_id uuid;
 begin
+  select organization_id
+  into command_organization_id
+  from public.command_log
+  where id = new.command_id;
+
+  if command_organization_id is distinct from new.organization_id then
+    raise exception using
+      errcode = 'P0001',
+      message = 'V2_APPROVAL_COMMAND_TENANT_MISMATCH';
+  end if;
+
   select organization_id
   into requester_organization_id
   from public.organization_memberships
@@ -731,6 +768,82 @@ begin
       raise exception using
         errcode = 'P0001',
         message = 'V2_APPROVAL_IDENTITY_MUTATION_FORBIDDEN';
+    end if;
+  end if;
+
+  return new;
+end;
+$$;
+
+create or replace function public.v2_validate_command_actor_tenant()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+declare
+  actor_organization_id uuid;
+begin
+  if new.actor_membership_id is not null then
+    select organization_id
+    into actor_organization_id
+    from public.organization_memberships
+    where id = new.actor_membership_id;
+
+    if actor_organization_id is distinct from new.organization_id then
+      raise exception using
+        errcode = 'P0001',
+        message = 'V2_COMMAND_ACTOR_TENANT_MISMATCH';
+    end if;
+  end if;
+
+  return new;
+end;
+$$;
+
+create or replace function public.v2_validate_audit_tenant()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+declare
+  related_organization_id uuid;
+begin
+  if new.actor_membership_id is not null then
+    select organization_id
+    into related_organization_id
+    from public.organization_memberships
+    where id = new.actor_membership_id;
+
+    if related_organization_id is distinct from new.organization_id then
+      raise exception using
+        errcode = 'P0001',
+        message = 'V2_AUDIT_ACTOR_TENANT_MISMATCH';
+    end if;
+  end if;
+
+  if new.command_log_id is not null then
+    select organization_id
+    into related_organization_id
+    from public.command_log
+    where id = new.command_log_id;
+
+    if related_organization_id is distinct from new.organization_id then
+      raise exception using
+        errcode = 'P0001',
+        message = 'V2_AUDIT_COMMAND_TENANT_MISMATCH';
+    end if;
+  end if;
+
+  if new.approval_request_id is not null then
+    select organization_id
+    into related_organization_id
+    from public.approval_requests
+    where id = new.approval_request_id;
+
+    if related_organization_id is distinct from new.organization_id then
+      raise exception using
+        errcode = 'P0001',
+        message = 'V2_AUDIT_APPROVAL_TENANT_MISMATCH';
     end if;
   end if;
 
@@ -816,6 +929,15 @@ create trigger v2_permission_profiles_updated_at
 before update on public.permission_profiles
 for each row execute function public.set_updated_at();
 
+create trigger v2_memberships_inviter_validate_insert
+before insert on public.organization_memberships
+for each row execute function public.v2_validate_membership_inviter();
+create trigger v2_memberships_inviter_validate_update
+before update of invited_by on public.organization_memberships
+for each row
+when (old.invited_by is distinct from new.invited_by)
+execute function public.v2_validate_membership_inviter();
+
 create trigger v2_user_profiles_prevent_delete
 before delete on public.user_profiles
 for each row execute function public.v2_prevent_identity_delete();
@@ -880,6 +1002,14 @@ for each row execute function public.v2_guard_support_access_grant();
 create trigger v2_support_access_grants_guard_update
 before update on public.support_access_grants
 for each row execute function public.v2_guard_support_access_grant();
+
+create trigger v2_command_log_tenant_validate
+before insert or update on public.command_log
+for each row execute function public.v2_validate_command_actor_tenant();
+
+create trigger v2_audit_events_tenant_validate
+before insert on public.audit_events
+for each row execute function public.v2_validate_audit_tenant();
 
 -- =========================================================
 -- FOUNDATION FOREIGN KEYS
@@ -1072,6 +1202,8 @@ revoke all privileges on function public.v2_prevent_identity_delete()
   from public, anon, authenticated;
 revoke all privileges on function public.v2_guard_permission_mutation()
   from public, anon, authenticated;
+revoke all privileges on function public.v2_validate_membership_inviter()
+  from public, anon, authenticated;
 revoke all privileges on function public.v2_validate_profile_assignment()
   from public, anon, authenticated;
 revoke all privileges on function public.v2_validate_branch_access()
@@ -1081,6 +1213,10 @@ revoke all privileges on function public.v2_bump_membership_permission_version()
 revoke all privileges on function public.v2_guard_approval_request()
   from public, anon, authenticated;
 revoke all privileges on function public.v2_guard_support_access_grant()
+  from public, anon, authenticated;
+revoke all privileges on function public.v2_validate_command_actor_tenant()
+  from public, anon, authenticated;
+revoke all privileges on function public.v2_validate_audit_tenant()
   from public, anon, authenticated;
 revoke all privileges on function public.v2_text_array_has_no_blank(text[])
   from public, anon, authenticated;
