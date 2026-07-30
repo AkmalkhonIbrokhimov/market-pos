@@ -405,7 +405,9 @@ Unique `(organization_id,fingerprint_hash)`. Checks register belongs branch, rev
 
 ## 19. Категории
 
-### `categories`
+Migration 0010 использует physical coexistence tables `categories_v2`, `brands_v2`, `units_v2`, `product_types_v2` и `products_v2`. Одноимённые legacy tables из migrations 0001/0006 остаются неизменными для V1 UI и документов. Nullable unique mappings tenant-safe и не заполняются автоматически. Compatibility views с занятыми именами не создаются; rename возможен только после controlled backfill, reconciliation и feature cutover.
+
+### `categories` (conceptual) / `public.categories_v2` (physical coexistence table)
 
 **Контракт:** Catalog; tenant hierarchy. PK id; self FK parent set null; unique active normalized name under parent; RLS tenant read, catalog manage write; update draft metadata, delete запрещён, archive; source catalog commands; outbox `CategoryChanged`; offline reference projection.
 
@@ -426,7 +428,7 @@ Indexes `(organization_id,parent_id,sort_order)`, `(organization_id,status,name)
 
 ## 20. Бренды
 
-### `brands`
+### `brands` (conceptual) / `public.brands_v2` (physical coexistence table)
 
 **Контракт:** Catalog; бренд организации. PK id; unique active normalized name; RLS tenant read/catalog manage; update allowed, delete запрещён, archive; outbox `BrandChanged`; offline reference.
 
@@ -445,7 +447,7 @@ Partial unique `(organization_id,lower(name)) where archived_at is null`; index 
 
 ## 21. Единицы измерения
 
-### `units`
+### `units` (conceptual) / `public.units_v2` (physical coexistence table)
 
 **Контракт:** Catalog; tenant UOM. PK id; unique code and short name; RLS reference read/catalog manage; update label allowed before archive, delete запрещён if referenced; archive; outbox `UnitChanged`; offline reference.
 
@@ -486,7 +488,7 @@ Checks factor > 0, from != to, tenant consistency. Unique `(product_id,from_unit
 
 ## 23. Типы товаров
 
-### `product_types`
+### `product_types` (conceptual) / `public.product_types_v2` (physical coexistence table)
 
 **Контракт:** Catalog; поведение товара. PK id; unique code/name; RLS reference read/manage; update/archiving, delete запрещён; outbox `ProductTypeChanged`; offline reference.
 
@@ -507,7 +509,7 @@ Unique `(organization_id,code)` and active name; behavior schema validated by ap
 
 ## 24. Товары
 
-### `products`
+### `products` (conceptual) / `public.products_v2` (physical coexistence table)
 
 **Контракт:** Catalog; identity товара, без остатка и цены. PK id; FK category/brand/type/base unit restrict or set null only for optional references; unique SKU; RLS tenant safe read/catalog manage; update descriptive fields, delete запрещён, archive; source `create_or_update_product`; outbox `ProductCreated/Changed/Archived`; offline primary catalog projection.
 
@@ -2070,10 +2072,10 @@ Reconciliation jobs пишут result/cutoff, но не исправляют led
 | `0007_v2_foundation.sql` | command_log, outbox, audit, migration exceptions, helpers | Нет | 0001–0006; additive | Extensions/types/grants; fix forward new migration |
 | `0008_v2_identity_access.sql` | profiles, memberships, permissions, approvals, support grants | Add mapping refs only | 0007; V1 users continue | Auth duplicate scan; membership coverage |
 | `0009_v2_locations.sql` | `organization_settings`, branches, warehouses, registers, `devices_v2`; legacy `devices` untouched | stores/devices untouched; no mapping backfill | 0008 | Tenant-safe store/device mapping; one primary/default |
-| `0010_v2_catalog_compatibility.sql` | barcodes/images/conversions, compatibility views | Add nullable mapping columns if needed | 0009 | Duplicate barcode; old UI reads preserved |
-| `0011_v2_pricing.sql` | price lists/prices/requests/recommendations/history | products.sale_price retained | 0010 | One initial price; shadow compare |
+| `0010_v2_catalog_compatibility.sql` | physical `categories_v2`, `brands_v2`, `units_v2`, `product_types_v2`, `products_v2`, barcodes/images/conversions | Legacy catalog untouched; nullable mappings, no backfill/views | 0009 | Duplicate mappings/barcodes; V1 UI/FK preserved |
+| `0011_v2_pricing.sql` | price lists/prices/requests/recommendations/history referencing `products_v2` | legacy products.sale_price retained | 0010 | One initial price; shadow compare |
 | `0012_v2_counterparties.sql` | parties/roles/contacts/addresses/credit | supplier/customer untouched | 0008 | Duplicate candidates/exceptions |
-| `0013_v2_purchases_inventory.sql` | purchase/inventory documents, batches V2, ledgers/balances | No destructive changes | 0010–0012 | Synthetic doc rehearsal; stock reconciliation |
+| `0013_v2_purchases_inventory.sql` | purchase/inventory documents using `products_v2`, batches V2, ledgers/balances | Legacy documents keep FK to `public.products` | 0010–0012 | Synthetic doc rehearsal; stock reconciliation |
 | `0014_v2_sales_payments.sql` | sales/lines/returns/held/payments/fiscal | V1 sales retained | 0011,0013 | Total/payment/stock tests |
 | `0015_v2_debts_settlements.sql` | receivables/allocations/settlement tables | V1 debts retained | 0012,0014 | Debt and party ledger reconciliation |
 | `0016_v2_shifts_cash.sql` | shifts/totals/cash ledger | V1 shifts retained | 0014 | Open shift conflicts/totals |
