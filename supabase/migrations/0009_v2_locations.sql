@@ -167,6 +167,30 @@ create index devices_v2_register_status_idx
 create index devices_v2_last_seen_at_idx
   on public.devices_v2 (last_seen_at);
 
+create table public.organization_settings (
+  organization_id uuid primary key
+    references public.organizations(id) on delete restrict,
+  currency_code char(3) not null default 'UZS',
+  timezone text not null default 'Asia/Tashkent',
+  default_locale text not null default 'ru',
+  price_rounding_scale smallint not null default 0,
+  max_offline_hours integer not null default 24,
+  settings jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now(),
+  constraint organization_settings_currency_code_check
+    check (currency_code ~ '^[A-Z]{3}$'),
+  constraint organization_settings_timezone_not_blank_check
+    check (btrim(timezone) <> ''),
+  constraint organization_settings_locale_check
+    check (default_locale in ('ru', 'en', 'uz-Latn', 'uz-Cyrl')),
+  constraint organization_settings_rounding_scale_check
+    check (price_rounding_scale between 0 and 4),
+  constraint organization_settings_offline_hours_check
+    check (max_offline_hours between 1 and 168),
+  constraint organization_settings_object_check
+    check (jsonb_typeof(settings) = 'object')
+);
+
 -- =========================================================
 -- LOCATION GUARDS
 -- =========================================================
@@ -183,21 +207,66 @@ begin
 end;
 $$;
 
-create or replace function public.v2_guard_branch_update()
+create or replace function public.v2_guard_organization_settings_update()
 returns trigger
 language plpgsql
 set search_path = ''
 as $$
 begin
-  if new.id is distinct from old.id
-    or new.organization_id is distinct from old.organization_id
-    or new.code is distinct from old.code
-    or new.legacy_store_id is distinct from old.legacy_store_id
-    or new.created_at is distinct from old.created_at
-  then
+  if new.organization_id is distinct from old.organization_id then
     raise exception using
       errcode = 'P0001',
-      message = 'V2_BRANCH_IDENTITY_MUTATION_FORBIDDEN';
+      message = 'V2_ORGANIZATION_SETTINGS_IDENTITY_MUTATION_FORBIDDEN';
+  end if;
+
+  return new;
+end;
+$$;
+
+create or replace function public.v2_prevent_organization_settings_delete()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  raise exception using
+    errcode = 'P0001',
+    message = 'V2_ORGANIZATION_SETTINGS_DELETE_FORBIDDEN';
+end;
+$$;
+
+create or replace function public.v2_guard_branch()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+declare
+  legacy_store_organization_id uuid;
+begin
+  if new.legacy_store_id is not null then
+    select organization_id
+    into legacy_store_organization_id
+    from public.stores
+    where id = new.legacy_store_id;
+
+    if legacy_store_organization_id is distinct from new.organization_id then
+      raise exception using
+        errcode = 'P0001',
+        message = 'V2_BRANCH_LEGACY_STORE_TENANT_MISMATCH';
+    end if;
+  end if;
+
+  if tg_op = 'UPDATE' then
+    if new.id is distinct from old.id
+      or new.organization_id is distinct from old.organization_id
+      or new.code is distinct from old.code
+      or new.legacy_store_id is distinct from old.legacy_store_id
+      or new.created_at is distinct from old.created_at
+    then
+      raise exception using
+        errcode = 'P0001',
+        message = 'V2_BRANCH_IDENTITY_MUTATION_FORBIDDEN';
+    end if;
   end if;
 
   return new;
@@ -302,6 +371,7 @@ declare
   branch_organization_id uuid;
   register_organization_id uuid;
   register_branch_id uuid;
+  legacy_device_organization_id uuid;
 begin
   select organization_id
   into branch_organization_id
@@ -326,6 +396,20 @@ begin
       raise exception using
         errcode = 'P0001',
         message = 'V2_DEVICE_REGISTER_LOCATION_MISMATCH';
+    end if;
+  end if;
+
+  if new.legacy_device_id is not null then
+    select s.organization_id
+    into legacy_device_organization_id
+    from public.devices as legacy_device
+    join public.stores as s on s.id = legacy_device.store_id
+    where legacy_device.id = new.legacy_device_id;
+
+    if legacy_device_organization_id is distinct from new.organization_id then
+      raise exception using
+        errcode = 'P0001',
+        message = 'V2_DEVICE_LEGACY_TENANT_MISMATCH';
     end if;
   end if;
 
@@ -729,10 +813,20 @@ for each row execute function public.set_updated_at();
 create trigger v2_devices_v2_updated_at
 before update on public.devices_v2
 for each row execute function public.set_updated_at();
+create trigger v2_organization_settings_updated_at
+before update on public.organization_settings
+for each row execute function public.set_updated_at();
 
-create trigger v2_branches_guard_update
-before update on public.branches
-for each row execute function public.v2_guard_branch_update();
+create trigger v2_organization_settings_identity_guard
+before update on public.organization_settings
+for each row execute function public.v2_guard_organization_settings_update();
+create trigger v2_organization_settings_prevent_delete
+before delete on public.organization_settings
+for each row execute function public.v2_prevent_organization_settings_delete();
+
+create trigger v2_branches_guard
+before insert or update on public.branches
+for each row execute function public.v2_guard_branch();
 create trigger v2_warehouses_guard
 before insert or update on public.warehouses
 for each row execute function public.v2_guard_warehouse();
@@ -797,6 +891,14 @@ alter table public.branches enable row level security;
 alter table public.warehouses enable row level security;
 alter table public.registers enable row level security;
 alter table public.devices_v2 enable row level security;
+alter table public.organization_settings enable row level security;
+
+create policy organization_settings_select_authorized
+on public.organization_settings for select to authenticated
+using (
+  public.v2_is_active_member(organization_id)
+  or public.v2_has_support_grant(organization_id, 'organization.manage')
+);
 
 create policy branches_select_authorized
 on public.branches for select to authenticated
@@ -830,14 +932,16 @@ revoke all privileges on table
   public.branches,
   public.warehouses,
   public.registers,
-  public.devices_v2
+  public.devices_v2,
+  public.organization_settings
 from public, anon, authenticated;
 
 grant select on table
   public.branches,
   public.warehouses,
   public.registers,
-  public.devices_v2
+  public.devices_v2,
+  public.organization_settings
 to authenticated;
 
 revoke all privileges on function public.v2_can_access_branch(uuid, uuid)
@@ -847,7 +951,11 @@ grant execute on function public.v2_can_access_branch(uuid, uuid)
 
 revoke all privileges on function public.v2_prevent_location_delete()
   from public, anon, authenticated;
-revoke all privileges on function public.v2_guard_branch_update()
+revoke all privileges on function public.v2_guard_organization_settings_update()
+  from public, anon, authenticated;
+revoke all privileges on function public.v2_prevent_organization_settings_delete()
+  from public, anon, authenticated;
+revoke all privileges on function public.v2_guard_branch()
   from public, anon, authenticated;
 revoke all privileges on function public.v2_guard_warehouse()
   from public, anon, authenticated;

@@ -307,6 +307,10 @@ Checks согласованности status/approver/decided_at. Индексы
 
 Checks `expires_at > starts_at`, active requires approver. Индекс `(service_admin_profile_id,status,expires_at)`.
 
+### `organization_settings` (migration 0009)
+
+Настройки организации хранят currency, timezone, locale, округление цен, допустимое offline-окно и расширяемый JSON object. Строка создаётся только будущей server command; migration 0009 не выполняет backfill существующих organizations. Browser получает только RLS-защищённый SELECT для active membership или точного support scope `organization.manage`.
+
 ## 15. Филиалы
 
 ### `branches`
@@ -328,7 +332,7 @@ Checks `expires_at > starts_at`, active requires approver. Индекс `(servic
 | updated_at | timestamptz | нет | now() | Изменение |
 | archived_at | timestamptz | да | — | Архив |
 
-Indexes `(organization_id,status,name)`, unique active `(organization_id,lower(code))`, unique non-null legacy id.
+Indexes `(organization_id,status,name)`, unique active `(organization_id,lower(code))`, unique non-null legacy id. `legacy_store_id` принимается только если `public.stores.organization_id` совпадает с branch tenant; mapping создаётся явно без backfill.
 
 ## 16. Склады
 
@@ -378,7 +382,7 @@ Warehouse обязан принадлежать тому же branch. Unique `(b
 
 ### `devices` (conceptual) / `public.devices_v2` (physical coexistence table)
 
-**Контракт:** Devices; зарегистрированное offline-устройство. Во время coexistence целевой V2-контракт физически хранится в `public.devices_v2`. Существующая `public.devices` остаётся неизменённой legacy V1-таблицей; controlled backfill/cutover и возможное переименование допускаются только отдельной будущей миграцией. PK id; FK organization/branch/register restrict; optional unique `legacy_device_id` mapping к V1; unique fingerprint hash per tenant; RLS own assigned users/owner/support; registration/revoke commands; update только heartbeat/cursor server-side; delete запрещён, revoke; outbox `DeviceRegistered/Revoked`; является offline actor.
+**Контракт:** Devices; зарегистрированное offline-устройство. Во время coexistence целевой V2-контракт физически хранится в `public.devices_v2`. Существующая `public.devices` остаётся неизменённой legacy V1-таблицей; controlled backfill/cutover и возможное переименование допускаются только отдельной будущей миграцией. PK id; FK organization/branch/register restrict; optional unique `legacy_device_id` mapping к V1; mapping проверяет tenant через `public.devices.store_id → public.stores.organization_id` и создаётся только явно, без backfill. V1 ownership после mapping не может переноситься между tenants; окончательная защита ownership и cutover выполняются будущей controlled migration. Unique fingerprint hash per tenant; RLS own assigned users/owner/support; registration/revoke commands; update только heartbeat/cursor server-side; delete запрещён, revoke; outbox `DeviceRegistered/Revoked`; является offline actor.
 
 | Поле | PostgreSQL type | Null | Default | Назначение |
 | --- | --- | --- | --- | --- |
@@ -2065,7 +2069,7 @@ Reconciliation jobs пишут result/cutoff, но не исправляют led
 | --- | --- | --- | --- | --- |
 | `0007_v2_foundation.sql` | command_log, outbox, audit, migration exceptions, helpers | Нет | 0001–0006; additive | Extensions/types/grants; fix forward new migration |
 | `0008_v2_identity_access.sql` | profiles, memberships, permissions, approvals, support grants | Add mapping refs only | 0007; V1 users continue | Auth duplicate scan; membership coverage |
-| `0009_v2_locations.sql` | settings, branches, warehouses, registers, `devices_v2`; legacy `devices` untouched | stores/devices untouched | 0008 | Store/device mapping dry run; one primary/default |
+| `0009_v2_locations.sql` | `organization_settings`, branches, warehouses, registers, `devices_v2`; legacy `devices` untouched | stores/devices untouched; no mapping backfill | 0008 | Tenant-safe store/device mapping; one primary/default |
 | `0010_v2_catalog_compatibility.sql` | barcodes/images/conversions, compatibility views | Add nullable mapping columns if needed | 0009 | Duplicate barcode; old UI reads preserved |
 | `0011_v2_pricing.sql` | price lists/prices/requests/recommendations/history | products.sale_price retained | 0010 | One initial price; shadow compare |
 | `0012_v2_counterparties.sql` | parties/roles/contacts/addresses/credit | supplier/customer untouched | 0008 | Duplicate candidates/exceptions |

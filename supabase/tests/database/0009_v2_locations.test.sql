@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = public, extensions;
 
-select plan(169);
+select plan(212);
 
 select has_table('public', relation_name, relation_name || ' exists')
 from (
@@ -111,7 +111,7 @@ select has_function('public', function_name, array[]::text[], function_name || '
 from (
   values
     ('v2_prevent_location_delete'),
-    ('v2_guard_branch_update'),
+    ('v2_guard_branch'),
     ('v2_guard_warehouse'),
     ('v2_guard_register'),
     ('v2_guard_device')
@@ -278,6 +278,181 @@ select is((select count(*) from public.warehouses where organization_id='0000000
 select is((select count(*) from public.registers where organization_id='00000000-0000-0000-0000-000000009102'),0::bigint,'registers RLS isolates tenant');
 select is((select count(*) from public.devices_v2 where organization_id='00000000-0000-0000-0000-000000009102'),0::bigint,'devices_v2 RLS isolates tenant');
 reset role;
+
+-- Organization settings contract, guards, grants, and RLS.
+select has_table('public', 'organization_settings', 'organization_settings exists');
+select has_column('public', 'organization_settings', column_name, 'organization_settings.' || column_name || ' exists')
+from (
+  values
+    ('organization_id'), ('currency_code'), ('timezone'), ('default_locale'),
+    ('price_rounding_scale'), ('max_offline_hours'), ('settings'), ('updated_at')
+) as columns(column_name);
+select ok(
+  exists (
+    select 1 from pg_catalog.pg_constraint
+    where conrelid = 'public.organization_settings'::regclass
+      and contype = 'p'
+      and conkey = array[
+        (select attnum from pg_catalog.pg_attribute
+         where attrelid = 'public.organization_settings'::regclass
+           and attname = 'organization_id')
+      ]::smallint[]
+  ),
+  'organization_settings.organization_id is primary key'
+);
+select ok(
+  exists (
+    select 1 from pg_catalog.pg_constraint
+    where conrelid = 'public.organization_settings'::regclass
+      and conname = 'organization_settings_organization_id_fkey'
+      and contype = 'f'
+  ),
+  'organization_settings organization FK exists'
+);
+
+insert into public.organization_settings (organization_id, updated_at)
+values ('00000000-0000-0000-0000-000000009101', now() - interval '1 hour');
+insert into public.organization_settings (organization_id, settings)
+values ('00000000-0000-0000-0000-000000009102', '{"tenant":"b"}');
+
+select ok(
+  (
+    select currency_code = 'UZS'
+      and timezone = 'Asia/Tashkent'
+      and default_locale = 'ru'
+      and price_rounding_scale = 0
+      and max_offline_hours = 24
+      and settings = '{}'::jsonb
+    from public.organization_settings
+    where organization_id = '00000000-0000-0000-0000-000000009101'
+  ),
+  'organization_settings defaults are exact'
+);
+select throws_ok($$insert into public.organization_settings (organization_id,currency_code) values (gen_random_uuid(),'12$')$$,'23514',null,'invalid currency rejected');
+select throws_ok($$insert into public.organization_settings (organization_id,currency_code) values (gen_random_uuid(),'uzs')$$,'23514',null,'lowercase currency rejected');
+select throws_ok($$insert into public.organization_settings (organization_id,timezone) values (gen_random_uuid(),' ')$$,'23514',null,'blank timezone rejected');
+select throws_ok($$insert into public.organization_settings (organization_id,default_locale) values (gen_random_uuid(),'fr')$$,'23514',null,'invalid locale rejected');
+select throws_ok($$insert into public.organization_settings (organization_id,price_rounding_scale) values (gen_random_uuid(),-1)$$,'23514',null,'negative rounding scale rejected');
+select throws_ok($$insert into public.organization_settings (organization_id,price_rounding_scale) values (gen_random_uuid(),5)$$,'23514',null,'rounding scale above four rejected');
+select throws_ok($$insert into public.organization_settings (organization_id,max_offline_hours) values (gen_random_uuid(),0)$$,'23514',null,'zero offline hours rejected');
+select throws_ok($$insert into public.organization_settings (organization_id,max_offline_hours) values (gen_random_uuid(),169)$$,'23514',null,'offline hours above 168 rejected');
+select throws_ok($$insert into public.organization_settings (organization_id,settings) values (gen_random_uuid(),'[]')$$,'23514',null,'settings array rejected');
+select lives_ok(
+  $$update public.organization_settings
+    set settings = '{"receipt":{"copies":2}}'::jsonb
+    where organization_id = '00000000-0000-0000-0000-000000009101'$$,
+  'settings object update allowed'
+);
+select throws_ok(
+  $$update public.organization_settings
+    set organization_id = '00000000-0000-0000-0000-000000009102'
+    where organization_id = '00000000-0000-0000-0000-000000009101'$$,
+  'P0001', 'V2_ORGANIZATION_SETTINGS_IDENTITY_MUTATION_FORBIDDEN',
+  'organization settings identity immutable'
+);
+select ok(
+  (select updated_at > now() - interval '5 minutes'
+   from public.organization_settings
+   where organization_id = '00000000-0000-0000-0000-000000009101'),
+  'organization settings updated_at advances'
+);
+select throws_ok(
+  $$delete from public.organization_settings
+    where organization_id = '00000000-0000-0000-0000-000000009102'$$,
+  'P0001', 'V2_ORGANIZATION_SETTINGS_DELETE_FORBIDDEN',
+  'organization settings hard delete rejected'
+);
+select ok(
+  (select relrowsecurity from pg_catalog.pg_class
+   where oid = 'public.organization_settings'::regclass),
+  'organization_settings has RLS enabled'
+);
+select ok(
+  not has_table_privilege('anon','public.organization_settings','SELECT, INSERT, UPDATE, DELETE'),
+  'anon has no organization_settings privileges'
+);
+select ok(
+  not has_table_privilege('authenticated','public.organization_settings','INSERT, UPDATE, DELETE'),
+  'authenticated cannot write organization_settings'
+);
+select ok(
+  has_table_privilege('authenticated','public.organization_settings','SELECT'),
+  'authenticated has RLS-protected organization_settings SELECT'
+);
+
+select set_config('request.jwt.claim.sub','00000000-0000-0000-0000-000000009001',true);
+set local role authenticated;
+select is((select count(*) from public.organization_settings where organization_id='00000000-0000-0000-0000-000000009101'),1::bigint,'active member sees own organization settings');
+select is((select count(*) from public.organization_settings where organization_id='00000000-0000-0000-0000-000000009102'),0::bigint,'member cannot see another tenant settings');
+reset role;
+update public.organization_memberships set status='blocked' where id='00000000-0000-0000-0000-000000009301';
+set local role authenticated;
+select is((select count(*) from public.organization_settings where organization_id='00000000-0000-0000-0000-000000009101'),0::bigint,'blocked membership cannot see organization settings');
+reset role;
+update public.organization_memberships set status='active' where id='00000000-0000-0000-0000-000000009301';
+
+insert into public.support_access_grants (
+  organization_id,service_admin_profile_id,scopes,reason,status,
+  approved_by_membership_id,starts_at,expires_at
+)
+values (
+  '00000000-0000-0000-0000-000000009102',
+  '00000000-0000-0000-0000-000000009204',
+  array['organization.manage'],'Settings support','active',
+  '00000000-0000-0000-0000-000000009303',
+  now()-interval '1 minute',now()+interval '1 hour'
+);
+select set_config('request.jwt.claim.sub','00000000-0000-0000-0000-000000009004',true);
+set local role authenticated;
+select is((select count(*) from public.organization_settings where organization_id='00000000-0000-0000-0000-000000009102'),1::bigint,'support exact organization.manage scope sees settings');
+reset role;
+
+select ok(not has_function_privilege('public','public.v2_guard_organization_settings_update()','EXECUTE'),'public cannot execute settings update guard');
+select ok(not has_function_privilege('anon','public.v2_guard_organization_settings_update()','EXECUTE'),'anon cannot execute settings update guard');
+select ok(not has_function_privilege('authenticated','public.v2_guard_organization_settings_update()','EXECUTE'),'authenticated cannot execute settings update guard');
+select ok(not has_function_privilege('public','public.v2_prevent_organization_settings_delete()','EXECUTE'),'public cannot execute settings delete guard');
+select ok(not has_function_privilege('anon','public.v2_prevent_organization_settings_delete()','EXECUTE'),'anon cannot execute settings delete guard');
+select ok(not has_function_privilege('authenticated','public.v2_prevent_organization_settings_delete()','EXECUTE'),'authenticated cannot execute settings delete guard');
+
+-- Tenant-safe legacy mappings without backfill.
+insert into public.stores (id,organization_id,name)
+values ('00000000-0000-0000-0000-000000009113','00000000-0000-0000-0000-000000009101','Legacy A2');
+insert into public.devices (id,store_id,name,device_type)
+values ('00000000-0000-0000-0000-000000009123','00000000-0000-0000-0000-000000009113','Legacy device A2','desktop');
+select lives_ok(
+  $$insert into public.branches (organization_id,code,name,legacy_store_id)
+    values ('00000000-0000-0000-0000-000000009101','A3','Branch A3','00000000-0000-0000-0000-000000009113')$$,
+  'branch accepts legacy store from same tenant'
+);
+select throws_ok(
+  $$insert into public.branches (organization_id,code,name,legacy_store_id)
+    values ('00000000-0000-0000-0000-000000009101','BADMAP','Bad mapping','00000000-0000-0000-0000-000000009112')$$,
+  'P0001','V2_BRANCH_LEGACY_STORE_TENANT_MISMATCH',
+  'branch rejects legacy store from another tenant'
+);
+select lives_ok(
+  $$insert into public.devices_v2
+    (organization_id,branch_id,legacy_device_id,name,device_type,fingerprint_hash)
+    values (
+      '00000000-0000-0000-0000-000000009101',
+      '00000000-0000-0000-0000-000000009401',
+      '00000000-0000-0000-0000-000000009123',
+      'Mapped A2','desktop','mapped-a2'
+    )$$,
+  'devices_v2 accepts legacy device from same tenant'
+);
+select throws_ok(
+  $$insert into public.devices_v2
+    (organization_id,branch_id,legacy_device_id,name,device_type,fingerprint_hash)
+    values (
+      '00000000-0000-0000-0000-000000009101',
+      '00000000-0000-0000-0000-000000009401',
+      '00000000-0000-0000-0000-000000009122',
+      'Bad mapping','desktop','bad-legacy-tenant'
+    )$$,
+  'P0001','V2_DEVICE_LEGACY_TENANT_MISMATCH',
+  'devices_v2 rejects legacy device from another tenant'
+);
 
 select * from finish();
 rollback;
