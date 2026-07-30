@@ -1,7 +1,7 @@
 begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path=public,extensions;
-select plan(239);
+select plan(257);
 
 select has_table('public',t,t||' exists') from (values
 ('price_lists'),('price_change_requests'),('product_prices'),('price_history'),
@@ -69,7 +69,7 @@ select has_index('public',t,i,i||' exists') from (values
 ('price_change_requests','price_change_requests_decided_by_idx'),
 ('product_prices','product_prices_active_lookup_idx'),
 ('product_prices','product_prices_organization_product_idx'),
-('product_prices','product_prices_request_idx'),
+('product_prices','product_prices_request_key'),
 ('price_history','price_history_organization_product_idx'),
 ('price_history','price_history_list_product_idx'),
 ('price_recommendations','price_recommendations_request_idx'),
@@ -166,7 +166,12 @@ insert into units_v2(id,organization_id,code,name,short_name) values
 ('00000000-0000-0000-0000-000000011502','00000000-0000-0000-0000-000000011102','EA','Each','ea');
 insert into products_v2(id,organization_id,name,base_unit_id) values
 ('00000000-0000-0000-0000-000000011601','00000000-0000-0000-0000-000000011101','Product A','00000000-0000-0000-0000-000000011501'),
-('00000000-0000-0000-0000-000000011602','00000000-0000-0000-0000-000000011102','Product B','00000000-0000-0000-0000-000000011502');
+('00000000-0000-0000-0000-000000011602','00000000-0000-0000-0000-000000011102','Product B','00000000-0000-0000-0000-000000011502'),
+('00000000-0000-0000-0000-000000011603','00000000-0000-0000-0000-000000011101','First Manual','00000000-0000-0000-0000-000000011501'),
+('00000000-0000-0000-0000-000000011604','00000000-0000-0000-0000-000000011101','First Purchase','00000000-0000-0000-0000-000000011501'),
+('00000000-0000-0000-0000-000000011605','00000000-0000-0000-0000-000000011101','First Import','00000000-0000-0000-0000-000000011501'),
+('00000000-0000-0000-0000-000000011606','00000000-0000-0000-0000-000000011101','First System','00000000-0000-0000-0000-000000011501'),
+('00000000-0000-0000-0000-000000011607','00000000-0000-0000-0000-000000011101','Request Unique','00000000-0000-0000-0000-000000011501');
 
 select throws_ok($$insert into price_lists(organization_id,branch_id,code,name,currency_code)
  values('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011402','BAD','Bad','USD')$$,
@@ -199,7 +204,14 @@ select throws_ok($$insert into price_lists(organization_id,code,name,currency_co
  values('00000000-0000-0000-0000-000000011101','base','Duplicate','USD')$$,'23505',null,'list code unique case-insensitive');
 select throws_ok($$update price_lists set code='CHANGED' where id='00000000-0000-0000-0000-000000011701'$$,
  'P0001','V2_PRICE_LIST_IDENTITY_MUTATION_FORBIDDEN','list code immutable');
+select throws_ok($$update price_lists set currency_code='EUR' where id='00000000-0000-0000-0000-000000011701'$$,
+ 'P0001','V2_PRICE_LIST_CURRENCY_MUTATION_FORBIDDEN','list currency immutable');
 
+select throws_ok($$insert into price_change_requests(organization_id,product_id,price_list_id,requested_amount,source_type,requested_by)
+ values('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011601',
+ '00000000-0000-0000-0000-000000011701',10,'manual','00000000-0000-0000-0000-000000011301')$$,
+ 'P0001','V2_PRICING_COMMAND_CONTEXT_REQUIRED','direct request insert requires pricing context');
+select set_config('market_pos.pricing_command','on',true);
 select throws_ok($$insert into price_change_requests(organization_id,product_id,price_list_id,requested_amount,source_type,requested_by)
  values('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011602',
  '00000000-0000-0000-0000-000000011701',10,'manual','00000000-0000-0000-0000-000000011301')$$,
@@ -216,6 +228,7 @@ select throws_ok($$insert into price_change_requests(organization_id,product_id,
  values('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011601',
  '00000000-0000-0000-0000-000000011701',-1,'manual','00000000-0000-0000-0000-000000011301')$$,
  '23514',null,'negative requested amount rejected');
+select set_config('market_pos.pricing_command','off',true);
 
 select set_config('request.jwt.claim.sub','00000000-0000-0000-0000-000000011001',true);
 set local role authenticated;
@@ -228,6 +241,7 @@ select is((select current_amount from price_change_requests where product_id='00
 select is((select requested_amount from price_change_requests where status='pending'),10.0000::numeric,'requested amount scale value preserved');
 select is((select count(*) from audit_events where action='price_change.requested'),1::bigint,'request audit emitted atomically');
 select is((select count(*) from outbox_events where event_type='PriceChangeRequested'),1::bigint,'request outbox emitted atomically');
+select set_config('market_pos.pricing_command','on',true);
 select throws_ok($$insert into price_change_requests(organization_id,product_id,price_list_id,current_amount,requested_amount,source_type,requested_by)
  values('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011601',
  '00000000-0000-0000-0000-000000011701',null,11,'initial','00000000-0000-0000-0000-000000011301')$$,
@@ -240,6 +254,7 @@ select throws_ok($$insert into price_change_requests(organization_id,product_id,
  values('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011601',
  '00000000-0000-0000-0000-000000011703',null,13,'manual','00000000-0000-0000-0000-000000011901',
  '00000000-0000-0000-0000-000000011301')$$,'23505',null,'duplicate pending non-null source rejected');
+select set_config('market_pos.pricing_command','off',true);
 
 set local role authenticated;
 select lives_ok(format('select v2_confirm_price_change(%L)',
@@ -253,6 +268,30 @@ select is((select old_amount from price_history where price_list_id='00000000-00
 select is((select status from price_change_requests where price_list_id='00000000-0000-0000-0000-000000011701'),'confirmed','request confirmed');
 select is((select count(*) from audit_events where action='price_change.confirmed'),1::bigint,'confirmation audit emitted');
 select is((select count(*) from outbox_events where event_type='SalePriceConfirmed'),1::bigint,'confirmation outbox emitted');
+select is((select currency_code from product_prices where amount=10),'USD'::char(3),'existing price remains list-currency consistent');
+
+set local role authenticated;
+select lives_ok($$select v2_create_price_change_request('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011603','00000000-0000-0000-0000-000000011701',11,'manual','00000000-0000-0000-0000-000000011911')$$,'first manual request created');
+select lives_ok($$select v2_create_price_change_request('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011604','00000000-0000-0000-0000-000000011701',12,'purchase','00000000-0000-0000-0000-000000011912')$$,'first purchase request created');
+select lives_ok($$select v2_create_price_change_request('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011605','00000000-0000-0000-0000-000000011701',13,'import','00000000-0000-0000-0000-000000011913')$$,'first import request created');
+select lives_ok($$select v2_create_price_change_request('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011606','00000000-0000-0000-0000-000000011701',14,'system','00000000-0000-0000-0000-000000011914')$$,'first system request created');
+select lives_ok(format('select v2_confirm_price_change(%L)',(select id from price_change_requests where product_id='00000000-0000-0000-0000-000000011603' and status='pending')),'first manual price confirms');
+select lives_ok(format('select v2_confirm_price_change(%L)',(select id from price_change_requests where product_id='00000000-0000-0000-0000-000000011604' and status='pending')),'first purchase price confirms');
+select lives_ok(format('select v2_confirm_price_change(%L)',(select id from price_change_requests where product_id='00000000-0000-0000-0000-000000011605' and status='pending')),'first import price confirms');
+select lives_ok(format('select v2_confirm_price_change(%L)',(select id from price_change_requests where product_id='00000000-0000-0000-0000-000000011606' and status='pending')),'first system price confirms');
+select throws_ok($$select v2_create_price_change_request(
+ '00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011601',
+ '00000000-0000-0000-0000-000000011701',99,'initial','00000000-0000-0000-0000-000000011915')$$,
+ 'P0001','V2_PRICE_REQUEST_INITIAL_SOURCE_MISMATCH','initial source forbidden when current price exists');
+reset role;
+select is((select count(*) from price_history where product_id in(
+ '00000000-0000-0000-0000-000000011603','00000000-0000-0000-0000-000000011604',
+ '00000000-0000-0000-0000-000000011605','00000000-0000-0000-0000-000000011606')
+ and old_amount is null),4::bigint,'all non-initial first-price histories use NULL old_amount');
+select is((select count(distinct source_type) from price_history where product_id in(
+ '00000000-0000-0000-0000-000000011601','00000000-0000-0000-0000-000000011603',
+ '00000000-0000-0000-0000-000000011604','00000000-0000-0000-0000-000000011605',
+ '00000000-0000-0000-0000-000000011606')),5::bigint,'all five first-price source types confirmed');
 
 set local role authenticated;
 select lives_ok($$select v2_create_price_change_request(
@@ -261,14 +300,17 @@ select lives_ok($$select v2_create_price_change_request(
 select lives_ok(format('select v2_confirm_price_change(%L)',
  (select id from price_change_requests where requested_amount=20 and status='pending')),'second confirmation succeeds');
 reset role;
-select is((select count(*) from product_prices where price_list_id='00000000-0000-0000-0000-000000011701'),2::bigint,'second confirmation creates second version');
-select is((select count(*) from product_prices where price_list_id='00000000-0000-0000-0000-000000011701' and valid_to is null),1::bigint,'only one open price');
+select is((select count(*) from product_prices where price_list_id='00000000-0000-0000-0000-000000011701'
+ and product_id='00000000-0000-0000-0000-000000011601'),2::bigint,'second confirmation creates second version');
+select is((select count(*) from product_prices where price_list_id='00000000-0000-0000-0000-000000011701'
+ and product_id='00000000-0000-0000-0000-000000011601' and valid_to is null),1::bigint,'only one open price');
 select is((select valid_to from product_prices where amount=10),(select valid_from from product_prices where amount=20),'previous end equals next start');
 select is((select old_amount from price_history where new_amount=20),10.0000::numeric,'history records previous amount');
-select throws_ok($$update product_prices set amount=99 where amount=20$$,'P0001','V2_PRODUCT_PRICE_UPDATE_FORBIDDEN','price amount immutable');
-select throws_ok($$update product_prices set valid_to=now() where amount=20$$,'P0001','V2_PRODUCT_PRICE_UPDATE_FORBIDDEN','direct valid_to closure forbidden');
+select throws_ok($$update product_prices set amount=99 where amount=20$$,'P0001','V2_PRICING_COMMAND_CONTEXT_REQUIRED','price amount update requires context');
+select throws_ok($$update product_prices set valid_to=now() where amount=20$$,'P0001','V2_PRICING_COMMAND_CONTEXT_REQUIRED','direct valid_to closure requires context');
 select throws_ok($$update price_history set reason_code='changed'$$,'P0001','V2_PRICE_HISTORY_IMMUTABLE','history immutable');
 
+select set_config('market_pos.pricing_command','on',true);
 insert into price_change_requests(id,organization_id,product_id,price_list_id,current_amount,requested_amount,source_type,source_id,requested_by)
 values('00000000-0000-0000-0000-000000011801','00000000-0000-0000-0000-000000011101',
 '00000000-0000-0000-0000-000000011601','00000000-0000-0000-0000-000000011701',20,30,'manual',
@@ -277,6 +319,7 @@ insert into price_change_requests(id,organization_id,product_id,price_list_id,cu
 values('00000000-0000-0000-0000-000000011802','00000000-0000-0000-0000-000000011101',
 '00000000-0000-0000-0000-000000011601','00000000-0000-0000-0000-000000011701',20,40,'manual',
 '00000000-0000-0000-0000-000000011904','00000000-0000-0000-0000-000000011301');
+select set_config('market_pos.pricing_command','off',true);
 set local role authenticated;
 select lives_ok($$select v2_confirm_price_change('00000000-0000-0000-0000-000000011801')$$,'one concurrent-style request confirms');
 select throws_ok($$select v2_confirm_price_change('00000000-0000-0000-0000-000000011802')$$,
@@ -286,26 +329,33 @@ select is((select status from price_change_requests where id='00000000-0000-0000
 select is((select count(*) from product_prices where amount=40),0::bigint,'stale request inserts no price');
 select is((select count(*) from price_history where new_amount=40),0::bigint,'stale request inserts no history');
 
+select set_config('market_pos.pricing_command','on',true);
 insert into price_change_requests(id,organization_id,product_id,price_list_id,current_amount,requested_amount,source_type,source_id,requested_by)
 values('00000000-0000-0000-0000-000000011803','00000000-0000-0000-0000-000000011101',
 '00000000-0000-0000-0000-000000011601','00000000-0000-0000-0000-000000011701',30,50,'manual',
 '00000000-0000-0000-0000-000000011905','00000000-0000-0000-0000-000000011301');
+select set_config('market_pos.pricing_command','off',true);
 set local role authenticated;
 select lives_ok($$select v2_reject_price_change('00000000-0000-0000-0000-000000011803')$$,'rejection succeeds');
 select throws_ok($$select v2_reject_price_change('00000000-0000-0000-0000-000000011803')$$,
  'P0001','V2_PRICE_REQUEST_NOT_PENDING','repeat rejection rejected');
 reset role;
 select is((select status from price_change_requests where id='00000000-0000-0000-0000-000000011803'),'rejected','request rejected');
-select is((select amount from product_prices where valid_to is null),30.0000::numeric,'rejection leaves current price');
+select is((select amount from product_prices where product_id='00000000-0000-0000-0000-000000011601'
+ and price_list_id='00000000-0000-0000-0000-000000011701' and valid_to is null),30.0000::numeric,'rejection leaves current price');
 select is((select count(*) from price_history where new_amount=50),0::bigint,'rejection creates no price history');
 select is((select count(*) from outbox_events where event_type='PriceChangeRejected'),1::bigint,'rejection outbox emitted');
+select set_config('market_pos.pricing_command','on',true);
 select throws_ok($$update price_change_requests set requested_amount=99 where id='00000000-0000-0000-0000-000000011803'$$,
  'P0001','V2_PRICE_REQUEST_TERMINAL_IMMUTABLE','terminal request immutable');
+select set_config('market_pos.pricing_command','off',true);
 
+select set_config('market_pos.pricing_command','on',true);
 insert into price_change_requests(id,organization_id,product_id,price_list_id,current_amount,requested_amount,source_type,source_id,requested_by)
 values('00000000-0000-0000-0000-000000011804','00000000-0000-0000-0000-000000011101',
 '00000000-0000-0000-0000-000000011601','00000000-0000-0000-0000-000000011703',null,15,'purchase',
 '00000000-0000-0000-0000-000000011906','00000000-0000-0000-0000-000000011301');
+select set_config('market_pos.pricing_command','off',true);
 select lives_ok($$insert into price_recommendations(organization_id,price_change_request_id,product_id,purchase_price,
  previous_purchase_price,margin_percent,recommended_amount,calculation) values(
  '00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011804',
@@ -320,6 +370,15 @@ select throws_ok($$insert into price_recommendations(organization_id,price_chang
  values('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011804',
  '00000000-0000-0000-0000-000000011601',10,15,'[]')$$,'23514',null,'recommendation calculation object required');
 
+select throws_ok($$insert into product_prices(organization_id,price_list_id,product_id,amount,currency_code,valid_from,confirmed_by)
+ values('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011703',
+ '00000000-0000-0000-0000-000000011601',1,'USD','2025-01-01',
+ '00000000-0000-0000-0000-000000011301')$$,
+ 'P0001','V2_PRICING_COMMAND_CONTEXT_REQUIRED','direct product price insert requires context');
+select throws_ok($$insert into price_history(organization_id,product_price_id,price_list_id,product_id,old_amount,new_amount,reason_code,source_type,changed_by)
+ select organization_id,id,price_list_id,product_id,null,amount,'fake','manual',confirmed_by from product_prices limit 1$$,
+ 'P0001','V2_PRICING_COMMAND_CONTEXT_REQUIRED','direct history insert requires context');
+select set_config('market_pos.pricing_command','on',true);
 select throws_ok($$insert into product_prices(organization_id,price_list_id,product_id,amount,currency_code,valid_from,valid_to,confirmed_by)
  values('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011703',
  '00000000-0000-0000-0000-000000011601',1,'USD','2026-01-01','2026-01-10',
@@ -334,6 +393,23 @@ select lives_ok($$insert into product_prices(organization_id,price_list_id,produ
  ('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011703',
  '00000000-0000-0000-0000-000000011601',2,'USD','2026-01-10','2026-01-15',
  '00000000-0000-0000-0000-000000011301')$$,'adjacent intervals allowed');
+select throws_ok($$insert into price_history(organization_id,product_price_id,price_list_id,product_id,old_amount,new_amount,reason_code,source_type,changed_by)
+ select organization_id,id,price_list_id,product_id,99,amount,'forged','manual',confirmed_by
+ from product_prices where price_list_id='00000000-0000-0000-0000-000000011703' and valid_from='2026-01-10'$$,
+ 'P0001','V2_PRICE_HISTORY_PREVIOUS_AMOUNT_MISMATCH','forged previous history amount rejected');
+insert into price_change_requests(id,organization_id,product_id,price_list_id,current_amount,requested_amount,source_type,source_id,requested_by)
+values('00000000-0000-0000-0000-000000011805','00000000-0000-0000-0000-000000011101',
+'00000000-0000-0000-0000-000000011607','00000000-0000-0000-0000-000000011703',null,7,'manual',
+'00000000-0000-0000-0000-000000011916','00000000-0000-0000-0000-000000011301');
+insert into product_prices(organization_id,price_list_id,product_id,amount,currency_code,valid_from,valid_to,confirmed_by,price_change_request_id)
+values('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011703',
+'00000000-0000-0000-0000-000000011607',7,'USD','2027-01-01','2027-01-02',
+'00000000-0000-0000-0000-000000011301','00000000-0000-0000-0000-000000011805');
+select throws_ok($$insert into product_prices(organization_id,price_list_id,product_id,amount,currency_code,valid_from,valid_to,confirmed_by,price_change_request_id)
+values('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011703',
+'00000000-0000-0000-0000-000000011607',7,'USD','2027-01-02','2027-01-03',
+'00000000-0000-0000-0000-000000011301','00000000-0000-0000-0000-000000011805')$$,
+'23505',null,'one request cannot link two product prices');
 select throws_ok($$insert into product_prices(organization_id,price_list_id,product_id,amount,currency_code,valid_from,confirmed_by)
  values('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011701',
  '00000000-0000-0000-0000-000000011601',1,'EUR',now(),'00000000-0000-0000-0000-000000011301')$$,
@@ -342,6 +418,7 @@ select throws_ok($$insert into product_prices(organization_id,price_list_id,prod
  values('00000000-0000-0000-0000-000000011101','00000000-0000-0000-0000-000000011701',
  '00000000-0000-0000-0000-000000011602',1,'USD',now(),'00000000-0000-0000-0000-000000011301')$$,
  'P0001','V2_PRODUCT_PRICE_TENANT_MISMATCH','price tenant mismatch rejected');
+select set_config('market_pos.pricing_command','off',true);
 
 select throws_ok($$delete from price_lists where id='00000000-0000-0000-0000-000000011702'$$,
  'P0001','V2_PRICING_HARD_DELETE_FORBIDDEN','list hard delete rejected');

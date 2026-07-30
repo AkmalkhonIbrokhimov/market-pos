@@ -97,7 +97,7 @@ create index product_prices_active_lookup_idx
   on public.product_prices(price_list_id,product_id,valid_from desc);
 create index product_prices_organization_product_idx
   on public.product_prices(organization_id,product_id);
-create index product_prices_request_idx
+create unique index product_prices_request_key
   on public.product_prices(price_change_request_id) where price_change_request_id is not null;
 
 create table public.price_history (
@@ -117,10 +117,6 @@ create table public.price_history (
   constraint price_history_new_amount_check check (new_amount >= 0),
   constraint price_history_reason_check check (btrim(reason_code) <> ''),
   constraint price_history_source_check check (source_type in ('initial','manual','purchase','import','system')),
-  constraint price_history_initial_check check (
-    (source_type='initial' and old_amount is null) or
-    (source_type<>'initial' and old_amount is not null)
-  ),
   constraint price_history_product_price_key unique(product_price_id)
 );
 create index price_history_organization_product_idx
@@ -166,6 +162,9 @@ begin
       raise exception using errcode='P0001',message='V2_PRICE_LIST_BRANCH_TENANT_MISMATCH';
     end if;
   end if;
+  if tg_op='UPDATE' and new.currency_code is distinct from old.currency_code then
+    raise exception using errcode='P0001',message='V2_PRICE_LIST_CURRENCY_MUTATION_FORBIDDEN';
+  end if;
   if tg_op='UPDATE' and (
     new.id is distinct from old.id or new.organization_id is distinct from old.organization_id
     or new.branch_id is distinct from old.branch_id or new.code is distinct from old.code
@@ -179,6 +178,9 @@ returns trigger language plpgsql set search_path=''
 as $$
 declare v_product record; v_list record; v_member_org uuid;
 begin
+  if current_setting('market_pos.pricing_command',true) is distinct from 'on' then
+    raise exception using errcode='P0001',message='V2_PRICING_COMMAND_CONTEXT_REQUIRED';
+  end if;
   select organization_id,status into v_product from public.products_v2 where id=new.product_id;
   select organization_id,status into v_list from public.price_lists where id=new.price_list_id;
   select organization_id into v_member_org from public.organization_memberships where id=new.requested_by;
@@ -215,9 +217,11 @@ returns trigger language plpgsql set search_path=''
 as $$
 declare v_product record; v_list record; v_member_org uuid; v_request record;
 begin
+  if current_setting('market_pos.pricing_command',true) is distinct from 'on' then
+    raise exception using errcode='P0001',message='V2_PRICING_COMMAND_CONTEXT_REQUIRED';
+  end if;
   if tg_op='UPDATE' and (
-    current_setting('market_pos.pricing_command',true) is distinct from 'on'
-    or old.valid_to is not null or new.valid_to is null
+    old.valid_to is not null or new.valid_to is null
     or new.id is distinct from old.id or new.organization_id is distinct from old.organization_id
     or new.price_list_id is distinct from old.price_list_id or new.product_id is distinct from old.product_id
     or new.amount is distinct from old.amount or new.currency_code is distinct from old.currency_code
@@ -246,7 +250,7 @@ begin
       or v_request.product_id is distinct from new.product_id
       or v_request.price_list_id is distinct from new.price_list_id
       or v_request.requested_amount is distinct from new.amount
-      or v_request.status not in ('pending','confirmed')
+      or (tg_op='INSERT' and v_request.status is distinct from 'pending')
     then raise exception using errcode='P0001',message='V2_PRODUCT_PRICE_REQUEST_MISMATCH'; end if;
   end if;
   return new;
@@ -255,9 +259,12 @@ end $$;
 create or replace function public.v2_guard_price_history()
 returns trigger language plpgsql set search_path=''
 as $$
-declare v_price record; v_member_org uuid;
+declare v_price record; v_member_org uuid; v_previous_amount numeric(18,4); v_has_previous boolean;
 begin
   if tg_op='UPDATE' then raise exception using errcode='P0001',message='V2_PRICE_HISTORY_IMMUTABLE'; end if;
+  if current_setting('market_pos.pricing_command',true) is distinct from 'on' then
+    raise exception using errcode='P0001',message='V2_PRICING_COMMAND_CONTEXT_REQUIRED';
+  end if;
   select organization_id,price_list_id,product_id,amount into v_price
     from public.product_prices where id=new.product_price_id;
   select organization_id into v_member_org from public.organization_memberships where id=new.changed_by;
@@ -267,6 +274,19 @@ begin
     or v_price.amount is distinct from new.new_amount
     or v_member_org is distinct from new.organization_id
   then raise exception using errcode='P0001',message='V2_PRICE_HISTORY_TENANT_MISMATCH'; end if;
+  select pp.amount into v_previous_amount
+    from public.product_prices pp
+    where pp.price_list_id=new.price_list_id and pp.product_id=new.product_id
+      and pp.valid_from < (select valid_from from public.product_prices where id=new.product_price_id)
+    order by pp.valid_from desc limit 1;
+  v_has_previous:=found;
+  if (not v_has_previous and new.old_amount is not null)
+    or (v_has_previous and new.old_amount is distinct from v_previous_amount) then
+    raise exception using errcode='P0001',message='V2_PRICE_HISTORY_PREVIOUS_AMOUNT_MISMATCH';
+  end if;
+  if new.source_type='initial' and v_has_previous then
+    raise exception using errcode='P0001',message='V2_PRICE_REQUEST_INITIAL_SOURCE_MISMATCH';
+  end if;
   return new;
 end $$;
 
@@ -332,6 +352,10 @@ begin
   select amount into v_current from public.product_prices
     where product_id=p_product_id and price_list_id=p_price_list_id and valid_to is null
     order by valid_from desc limit 1;
+  if p_source_type='initial' and v_current is not null then
+    raise exception using errcode='P0001',message='V2_PRICE_REQUEST_INITIAL_SOURCE_MISMATCH';
+  end if;
+  perform set_config('market_pos.pricing_command','on',true);
   insert into public.price_change_requests(
     organization_id,product_id,price_list_id,current_amount,requested_amount,
     source_type,source_id,requested_by
@@ -351,6 +375,7 @@ begin
     jsonb_build_object('product_id',p_product_id,'price_list_id',p_price_list_id,
       'current_amount',v_current,'requested_amount',p_requested_amount,
       'source_type',p_source_type,'source_id',p_source_id),v_id);
+  perform set_config('market_pos.pricing_command','off',true);
   return v_id;
 end $$;
 
