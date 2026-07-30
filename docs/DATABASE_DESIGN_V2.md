@@ -376,9 +376,9 @@ Warehouse обязан принадлежать тому же branch. Unique `(b
 
 ## 18. Устройства
 
-### `devices`
+### `devices` (conceptual) / `public.devices_v2` (physical coexistence table)
 
-**Контракт:** Devices; зарегистрированное offline-устройство. PK id; FK organization/branch/register restrict; unique fingerprint hash per tenant; RLS own assigned users/owner/support; registration/revoke commands; update только heartbeat/cursor server-side; delete запрещён, revoke; outbox `DeviceRegistered/Revoked`; является offline actor.
+**Контракт:** Devices; зарегистрированное offline-устройство. Во время coexistence целевой V2-контракт физически хранится в `public.devices_v2`. Существующая `public.devices` остаётся неизменённой legacy V1-таблицей; controlled backfill/cutover и возможное переименование допускаются только отдельной будущей миграцией. PK id; FK organization/branch/register restrict; optional unique `legacy_device_id` mapping к V1; unique fingerprint hash per tenant; RLS own assigned users/owner/support; registration/revoke commands; update только heartbeat/cursor server-side; delete запрещён, revoke; outbox `DeviceRegistered/Revoked`; является offline actor.
 
 | Поле | PostgreSQL type | Null | Default | Назначение |
 | --- | --- | --- | --- | --- |
@@ -386,6 +386,7 @@ Warehouse обязан принадлежать тому же branch. Unique `(b
 | organization_id | uuid | нет | — | Tenant |
 | branch_id | uuid | нет | — | Филиал |
 | register_id | uuid | да | — | Касса |
+| legacy_device_id | uuid | да | — | Optional mapping к legacy `public.devices` |
 | name | text | нет | — | Имя |
 | device_type | text | нет | — | `desktop`, `tablet`, `mobile` |
 | fingerprint_hash | text | нет | — | Необратимый fingerprint |
@@ -2064,7 +2065,7 @@ Reconciliation jobs пишут result/cutoff, но не исправляют led
 | --- | --- | --- | --- | --- |
 | `0007_v2_foundation.sql` | command_log, outbox, audit, migration exceptions, helpers | Нет | 0001–0006; additive | Extensions/types/grants; fix forward new migration |
 | `0008_v2_identity_access.sql` | profiles, memberships, permissions, approvals, support grants | Add mapping refs only | 0007; V1 users continue | Auth duplicate scan; membership coverage |
-| `0009_v2_locations.sql` | settings, branches, warehouses, registers, devices V2 | stores untouched | 0008 | Store mapping dry run; one primary/default |
+| `0009_v2_locations.sql` | settings, branches, warehouses, registers, `devices_v2`; legacy `devices` untouched | stores/devices untouched | 0008 | Store/device mapping dry run; one primary/default |
 | `0010_v2_catalog_compatibility.sql` | barcodes/images/conversions, compatibility views | Add nullable mapping columns if needed | 0009 | Duplicate barcode; old UI reads preserved |
 | `0011_v2_pricing.sql` | price lists/prices/requests/recommendations/history | products.sale_price retained | 0010 | One initial price; shadow compare |
 | `0012_v2_counterparties.sql` | parties/roles/contacts/addresses/credit | supplier/customer untouched | 0008 | Duplicate candidates/exceptions |
