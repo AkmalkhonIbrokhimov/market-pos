@@ -581,7 +581,7 @@ Checks size > 0, approved MIME. Unique bucket/path; one active primary per produ
 
 ### `price_lists`
 
-**Контракт:** Pricing; область цены. PK id; FK organization, optional branch; unique code per tenant; RLS safe read/pricing manage; update metadata, delete запрещён, archive; outbox `PriceListChanged`; offline assigned lists.
+**Контракт:** Pricing; область цены. PK id; FK organization, optional branch; unique code per tenant; RLS safe read/pricing manage; update metadata, delete запрещён, archive; outbox `PriceListChanged`; offline assigned lists. `currency_code` immutable после создания: для другой валюты создаётся новый price list, поэтому существующие price versions всегда сохраняют соответствие валюте своего списка.
 
 | Поле | PostgreSQL type | Null | Default | Назначение |
 | --- | --- | --- | --- | --- |
@@ -602,7 +602,7 @@ Unique `(organization_id,code)`, partial unique default per scope. Branch tenant
 
 ### `product_prices`
 
-**Контракт:** Pricing; подтверждённые версии sale price. PK id; FK product/list/request restrict; no overlapping active periods; RLS browser safe read, writes only `confirm_price_change`; update/delete запрещены, correction closes interval and inserts row; outbox `SalePriceConfirmed`; offline versioned price projection.
+**Контракт:** Pricing; подтверждённые версии sale price. Все product FK направлены только на физическую `public.products_v2`. PK id; FK product/list/request restrict; no overlapping active periods; один request создаёт максимум одну confirmed price row. RLS browser safe read, writes only controlled pricing functions. Business data append-only: единственный допустимый UPDATE закрывает `valid_to` из NULL в timestamp внутри `v2_confirm_price_change`; correction closes interval and inserts row. Delete запрещён; outbox `SalePriceConfirmed`; offline versioned price projection.
 
 | Поле | PostgreSQL type | Null | Default | Назначение |
 | --- | --- | --- | --- | --- |
@@ -630,6 +630,7 @@ Checks amount >= 0, valid_to > valid_from. Exclusion constraint по product/lis
 | --- | --- | --- | --- | --- |
 | id | uuid | нет | gen_random_uuid() | History event |
 | organization_id | uuid | нет | — | Tenant |
+| product_price_id | uuid | нет | — | Подтверждённая версия `product_prices` |
 | price_list_id | uuid | нет | — | List |
 | product_id | uuid | нет | — | Product |
 | old_amount | numeric(18,4) | да | — | Было |
@@ -654,7 +655,7 @@ Checks nonnegative values. Индекс `(organization_id,product_id,created_at 
 | organization_id | uuid | нет | — | Tenant |
 | product_id | uuid | нет | — | Product |
 | price_list_id | uuid | нет | — | List |
-| current_amount | numeric(18,4) | нет | — | Текущая цена |
+| current_amount | numeric(18,4) | да | — | Текущая цена; NULL означает initial price |
 | requested_amount | numeric(18,4) | нет | — | Предложение |
 | source_type | text | нет | — | Причина |
 | source_id | uuid | да | — | Приход |
@@ -682,6 +683,25 @@ Checks nonnegative values. Индекс `(organization_id,product_id,created_at 
 | created_at | timestamptz | нет | now() | Создание |
 
 Checks nonnegative. Request status consistency and indexes `(organization_id,status,created_at)` and `(product_id,created_at desc)`.
+
+### Coexistence pricing V1/V2
+
+Migration `0011_v2_pricing.sql` не изменяет legacy `public.products` и
+`public.products.sale_price`. V1 UI продолжает читать и записывать legacy price
+своим существующим путём. Pricing V2 ссылается только на `public.products_v2`;
+backfill, trigger-based dual-write и compatibility views отсутствуют.
+Сопоставление и переключение чтения выполняются только как controlled cutover
+после migrations 0019–0020.
+
+Все runtime mutations pricing выполняются только controlled RPC при активном
+transaction-local context `market_pos.pricing_command`. Даже trusted backend не
+может напрямую вставлять requests, confirmed prices или history без этого
+context; browser table writes также закрыты. `source_type` описывает происхождение
+(`initial`, `manual`, `purchase`, `import`, `system`) и не является sentinel
+наличия предыдущей цены. Первая цена допускает любой из этих source types,
+а `old_amount = NULL` определяется фактическим отсутствием предыдущей
+`product_prices` version. Для последующих версий `old_amount` обязан точно
+совпадать с amount предыдущей версии.
 
 ```mermaid
 erDiagram
