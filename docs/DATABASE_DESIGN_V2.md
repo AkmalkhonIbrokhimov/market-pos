@@ -307,6 +307,10 @@ Checks согласованности status/approver/decided_at. Индексы
 
 Checks `expires_at > starts_at`, active requires approver. Индекс `(service_admin_profile_id,status,expires_at)`.
 
+### `organization_settings` (migration 0009)
+
+Настройки организации хранят currency, timezone, locale, округление цен, допустимое offline-окно и расширяемый JSON object. Строка создаётся только будущей server command; migration 0009 не выполняет backfill существующих organizations. Browser получает только RLS-защищённый SELECT для active membership или точного support scope `organization.manage`.
+
 ## 15. Филиалы
 
 ### `branches`
@@ -328,7 +332,7 @@ Checks `expires_at > starts_at`, active requires approver. Индекс `(servic
 | updated_at | timestamptz | нет | now() | Изменение |
 | archived_at | timestamptz | да | — | Архив |
 
-Indexes `(organization_id,status,name)`, unique active `(organization_id,lower(code))`, unique non-null legacy id.
+Indexes `(organization_id,status,name)`, unique active `(organization_id,lower(code))`, unique non-null legacy id. `legacy_store_id` принимается только если `public.stores.organization_id` совпадает с branch tenant; mapping создаётся явно без backfill.
 
 ## 16. Склады
 
@@ -376,9 +380,9 @@ Warehouse обязан принадлежать тому же branch. Unique `(b
 
 ## 18. Устройства
 
-### `devices`
+### `devices` (conceptual) / `public.devices_v2` (physical coexistence table)
 
-**Контракт:** Devices; зарегистрированное offline-устройство. PK id; FK organization/branch/register restrict; unique fingerprint hash per tenant; RLS own assigned users/owner/support; registration/revoke commands; update только heartbeat/cursor server-side; delete запрещён, revoke; outbox `DeviceRegistered/Revoked`; является offline actor.
+**Контракт:** Devices; зарегистрированное offline-устройство. Во время coexistence целевой V2-контракт физически хранится в `public.devices_v2`. Существующая `public.devices` остаётся неизменённой legacy V1-таблицей; controlled backfill/cutover и возможное переименование допускаются только отдельной будущей миграцией. PK id; FK organization/branch/register restrict; optional unique `legacy_device_id` mapping к V1; mapping проверяет tenant через `public.devices.store_id → public.stores.organization_id` и создаётся только явно, без backfill. V1 ownership после mapping не может переноситься между tenants; окончательная защита ownership и cutover выполняются будущей controlled migration. Unique fingerprint hash per tenant; RLS own assigned users/owner/support; registration/revoke commands; update только heartbeat/cursor server-side; delete запрещён, revoke; outbox `DeviceRegistered/Revoked`; является offline actor.
 
 | Поле | PostgreSQL type | Null | Default | Назначение |
 | --- | --- | --- | --- | --- |
@@ -386,6 +390,7 @@ Warehouse обязан принадлежать тому же branch. Unique `(b
 | organization_id | uuid | нет | — | Tenant |
 | branch_id | uuid | нет | — | Филиал |
 | register_id | uuid | да | — | Касса |
+| legacy_device_id | uuid | да | — | Optional mapping к legacy `public.devices` |
 | name | text | нет | — | Имя |
 | device_type | text | нет | — | `desktop`, `tablet`, `mobile` |
 | fingerprint_hash | text | нет | — | Необратимый fingerprint |
@@ -400,7 +405,9 @@ Unique `(organization_id,fingerprint_hash)`. Checks register belongs branch, rev
 
 ## 19. Категории
 
-### `categories`
+Migration 0010 использует physical coexistence tables `categories_v2`, `brands_v2`, `units_v2`, `product_types_v2` и `products_v2`. Одноимённые legacy tables из migrations 0001/0006 остаются неизменными для V1 UI и документов. Nullable unique mappings tenant-safe и не заполняются автоматически. Compatibility views с занятыми именами не создаются; rename возможен только после controlled backfill, reconciliation и feature cutover.
+
+### `categories` (conceptual) / `public.categories_v2` (physical coexistence table)
 
 **Контракт:** Catalog; tenant hierarchy. PK id; self FK parent set null; unique active normalized name under parent; RLS tenant read, catalog manage write; update draft metadata, delete запрещён, archive; source catalog commands; outbox `CategoryChanged`; offline reference projection.
 
@@ -421,7 +428,7 @@ Indexes `(organization_id,parent_id,sort_order)`, `(organization_id,status,name)
 
 ## 20. Бренды
 
-### `brands`
+### `brands` (conceptual) / `public.brands_v2` (physical coexistence table)
 
 **Контракт:** Catalog; бренд организации. PK id; unique active normalized name; RLS tenant read/catalog manage; update allowed, delete запрещён, archive; outbox `BrandChanged`; offline reference.
 
@@ -440,7 +447,7 @@ Partial unique `(organization_id,lower(name)) where archived_at is null`; index 
 
 ## 21. Единицы измерения
 
-### `units`
+### `units` (conceptual) / `public.units_v2` (physical coexistence table)
 
 **Контракт:** Catalog; tenant UOM. PK id; unique code and short name; RLS reference read/catalog manage; update label allowed before archive, delete запрещён if referenced; archive; outbox `UnitChanged`; offline reference.
 
@@ -481,7 +488,7 @@ Checks factor > 0, from != to, tenant consistency. Unique `(product_id,from_unit
 
 ## 23. Типы товаров
 
-### `product_types`
+### `product_types` (conceptual) / `public.product_types_v2` (physical coexistence table)
 
 **Контракт:** Catalog; поведение товара. PK id; unique code/name; RLS reference read/manage; update/archiving, delete запрещён; outbox `ProductTypeChanged`; offline reference.
 
@@ -502,7 +509,7 @@ Unique `(organization_id,code)` and active name; behavior schema validated by ap
 
 ## 24. Товары
 
-### `products`
+### `products` (conceptual) / `public.products_v2` (physical coexistence table)
 
 **Контракт:** Catalog; identity товара, без остатка и цены. PK id; FK category/brand/type/base unit restrict or set null only for optional references; unique SKU; RLS tenant safe read/catalog manage; update descriptive fields, delete запрещён, archive; source `create_or_update_product`; outbox `ProductCreated/Changed/Archived`; offline primary catalog projection.
 
@@ -574,7 +581,7 @@ Checks size > 0, approved MIME. Unique bucket/path; one active primary per produ
 
 ### `price_lists`
 
-**Контракт:** Pricing; область цены. PK id; FK organization, optional branch; unique code per tenant; RLS safe read/pricing manage; update metadata, delete запрещён, archive; outbox `PriceListChanged`; offline assigned lists.
+**Контракт:** Pricing; область цены. PK id; FK organization, optional branch; unique code per tenant; RLS safe read/pricing manage; update metadata, delete запрещён, archive; outbox `PriceListChanged`; offline assigned lists. `currency_code` immutable после создания: для другой валюты создаётся новый price list, поэтому существующие price versions всегда сохраняют соответствие валюте своего списка.
 
 | Поле | PostgreSQL type | Null | Default | Назначение |
 | --- | --- | --- | --- | --- |
@@ -595,7 +602,7 @@ Unique `(organization_id,code)`, partial unique default per scope. Branch tenant
 
 ### `product_prices`
 
-**Контракт:** Pricing; подтверждённые версии sale price. PK id; FK product/list/request restrict; no overlapping active periods; RLS browser safe read, writes only `confirm_price_change`; update/delete запрещены, correction closes interval and inserts row; outbox `SalePriceConfirmed`; offline versioned price projection.
+**Контракт:** Pricing; подтверждённые версии sale price. Все product FK направлены только на физическую `public.products_v2`. PK id; FK product/list/request restrict; no overlapping active periods; один request создаёт максимум одну confirmed price row. RLS browser safe read, writes only controlled pricing functions. Business data append-only: единственный допустимый UPDATE закрывает `valid_to` из NULL в timestamp внутри `v2_confirm_price_change`; correction closes interval and inserts row. Delete запрещён; outbox `SalePriceConfirmed`; offline versioned price projection.
 
 | Поле | PostgreSQL type | Null | Default | Назначение |
 | --- | --- | --- | --- | --- |
@@ -623,6 +630,7 @@ Checks amount >= 0, valid_to > valid_from. Exclusion constraint по product/lis
 | --- | --- | --- | --- | --- |
 | id | uuid | нет | gen_random_uuid() | History event |
 | organization_id | uuid | нет | — | Tenant |
+| product_price_id | uuid | нет | — | Подтверждённая версия `product_prices` |
 | price_list_id | uuid | нет | — | List |
 | product_id | uuid | нет | — | Product |
 | old_amount | numeric(18,4) | да | — | Было |
@@ -647,7 +655,7 @@ Checks nonnegative values. Индекс `(organization_id,product_id,created_at 
 | organization_id | uuid | нет | — | Tenant |
 | product_id | uuid | нет | — | Product |
 | price_list_id | uuid | нет | — | List |
-| current_amount | numeric(18,4) | нет | — | Текущая цена |
+| current_amount | numeric(18,4) | да | — | Текущая цена; NULL означает initial price |
 | requested_amount | numeric(18,4) | нет | — | Предложение |
 | source_type | text | нет | — | Причина |
 | source_id | uuid | да | — | Приход |
@@ -675,6 +683,25 @@ Checks nonnegative values. Индекс `(organization_id,product_id,created_at 
 | created_at | timestamptz | нет | now() | Создание |
 
 Checks nonnegative. Request status consistency and indexes `(organization_id,status,created_at)` and `(product_id,created_at desc)`.
+
+### Coexistence pricing V1/V2
+
+Migration `0011_v2_pricing.sql` не изменяет legacy `public.products` и
+`public.products.sale_price`. V1 UI продолжает читать и записывать legacy price
+своим существующим путём. Pricing V2 ссылается только на `public.products_v2`;
+backfill, trigger-based dual-write и compatibility views отсутствуют.
+Сопоставление и переключение чтения выполняются только как controlled cutover
+после migrations 0019–0020.
+
+Все runtime mutations pricing выполняются только controlled RPC при активном
+transaction-local context `market_pos.pricing_command`. Даже trusted backend не
+может напрямую вставлять requests, confirmed prices или history без этого
+context; browser table writes также закрыты. `source_type` описывает происхождение
+(`initial`, `manual`, `purchase`, `import`, `system`) и не является sentinel
+наличия предыдущей цены. Первая цена допускает любой из этих source types,
+а `old_amount = NULL` определяется фактическим отсутствием предыдущей
+`product_prices` version. Для последующих версий `old_amount` обязан точно
+совпадать с amount предыдущей версии.
 
 ```mermaid
 erDiagram
@@ -2064,11 +2091,11 @@ Reconciliation jobs пишут result/cutoff, но не исправляют led
 | --- | --- | --- | --- | --- |
 | `0007_v2_foundation.sql` | command_log, outbox, audit, migration exceptions, helpers | Нет | 0001–0006; additive | Extensions/types/grants; fix forward new migration |
 | `0008_v2_identity_access.sql` | profiles, memberships, permissions, approvals, support grants | Add mapping refs only | 0007; V1 users continue | Auth duplicate scan; membership coverage |
-| `0009_v2_locations.sql` | settings, branches, warehouses, registers, devices V2 | stores untouched | 0008 | Store mapping dry run; one primary/default |
-| `0010_v2_catalog_compatibility.sql` | barcodes/images/conversions, compatibility views | Add nullable mapping columns if needed | 0009 | Duplicate barcode; old UI reads preserved |
-| `0011_v2_pricing.sql` | price lists/prices/requests/recommendations/history | products.sale_price retained | 0010 | One initial price; shadow compare |
+| `0009_v2_locations.sql` | `organization_settings`, branches, warehouses, registers, `devices_v2`; legacy `devices` untouched | stores/devices untouched; no mapping backfill | 0008 | Tenant-safe store/device mapping; one primary/default |
+| `0010_v2_catalog_compatibility.sql` | physical `categories_v2`, `brands_v2`, `units_v2`, `product_types_v2`, `products_v2`, barcodes/images/conversions | Legacy catalog untouched; nullable mappings, no backfill/views | 0009 | Duplicate mappings/barcodes; V1 UI/FK preserved |
+| `0011_v2_pricing.sql` | price lists/prices/requests/recommendations/history referencing `products_v2` | legacy products.sale_price retained | 0010 | One initial price; shadow compare |
 | `0012_v2_counterparties.sql` | parties/roles/contacts/addresses/credit | supplier/customer untouched | 0008 | Duplicate candidates/exceptions |
-| `0013_v2_purchases_inventory.sql` | purchase/inventory documents, batches V2, ledgers/balances | No destructive changes | 0010–0012 | Synthetic doc rehearsal; stock reconciliation |
+| `0013_v2_purchases_inventory.sql` | purchase/inventory documents using `products_v2`, batches V2, ledgers/balances | Legacy documents keep FK to `public.products` | 0010–0012 | Synthetic doc rehearsal; stock reconciliation |
 | `0014_v2_sales_payments.sql` | sales/lines/returns/held/payments/fiscal | V1 sales retained | 0011,0013 | Total/payment/stock tests |
 | `0015_v2_debts_settlements.sql` | receivables/allocations/settlement tables | V1 debts retained | 0012,0014 | Debt and party ledger reconciliation |
 | `0016_v2_shifts_cash.sql` | shifts/totals/cash ledger | V1 shifts retained | 0014 | Open shift conflicts/totals |
