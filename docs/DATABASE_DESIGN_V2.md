@@ -936,9 +936,15 @@ Unique pair, checks positive; sum allocations equals cost at posting.
 
 ## 37. Партии товаров
 
-### `product_batches`
+### `product_batches` (physical `public.product_batches_v2` during coexistence)
 
 **Контракт:** Inventory; lot created by posted purchase line, not document itself. PK id; FK warehouse/product/purchase line restrict; unique warehouse/batch code; RLS safe inventory read, insert only posting functions; update only controlled lifecycle metadata; delete forbidden, closed/expired statuses; outbox `BatchCreated/Depleted`; offline stock projection.
+
+Legacy `public.product_batches` остаётся V1-таблицей со ссылками на
+`stores`, `products` и `suppliers`. Migration 0013 создаёт только
+`public.product_batches_v2`; legacy table, её FK, текущий V1 UI/API и данные не
+изменяются и не получают dual-write/backfill. Controlled rename допустим только
+после backfill, reconciliation и feature cutover.
 
 | Поле | PostgreSQL type | Null | Default | Назначение |
 | --- | --- | --- | --- | --- |
@@ -1037,6 +1043,22 @@ Unique purchase and `(counterparty/template,delivery_date,sequence_number)` as a
 | comment | text | да | — | Reason details |
 
 Unique document/line. Checks nonzero delta. Header numbering indexes.
+
+### `warehouse_transfers`
+
+**Контракт:** Inventory; отдельный header межскладского перемещения. Transfer не
+является `inventory_documents.document_type`: source и destination warehouses
+проверяются в одном tenant/branch, posting создаёт равные по модулю out/in
+movements, reversal создаёт новый transfer. Draft mutable; posted/reversed
+immutable; idempotency scoped по organization/device/local operation.
+
+### `warehouse_transfer_lines`
+
+Строка ссылается только на `products_v2`, `units_v2` и optional source
+`product_batches_v2`. Поскольку batch физически warehouse-scoped, source batch
+используется только для outgoing movement; incoming movement обновляет aggregate
+destination balance без ложной cross-warehouse batch-ссылки. Оба balance scopes
+блокируются детерминированно.
 
 ## 40. Складские движения
 
@@ -2001,6 +2023,20 @@ Checks обеспечивают nonblank codes/names, allowed statuses, nonnegat
 | `cancel_or_reverse_sale` | sale, reason, approval/op | sales.reverse; lock full sale graph | reversal sale, opposite stock/payment/debt/cash, audit/outbox | reversal id; already_reversed, fiscal_reversal_required |
 | `record_debt_payment` | customer, allocations, payment rows, shift/op | debts.collect; lock shift/receivables due order | debt payment, payments/cash, allocations, receivable projections, audit/outbox | payment id; over_allocation, currency_mismatch |
 | `post_daily_delivery` | template, date, purchase lines/context/op | purchases.post_daily; purchase locks | daily doc plus exact `post_purchase` graph | daily/purchase ids; same purchase errors; repeat stable |
+
+### 0013 workflow hardening contract
+
+- Draft child mutations are scope-safe: create resolves and locks the real parent; update locks the existing child and verifies tenant plus exact parent before changing only draft fields. Child identity and parent links are immutable.
+- Purchase posting creates cost allocations automatically. Core Pilot supports `amount` and `quantity` bases only; `weight` and `manual` remain deferred until an explicit, auditable basis exists. Cost currency must equal the purchase currency. Values are rounded to four decimals and the deterministic final line receives the remainder, so every cost reconciles exactly.
+- Daily delivery uses one atomic command and correlation id for the purchase, wrapper, batches, movements, audit, and outbox graph. `purchases.post_daily` is independently sufficient; `purchases.draft.manage` is not required. A replay with the same operation and payload returns the original purchase, while a changed payload is rejected.
+- Inventory mutations acquire transaction-scoped advisory locks for every `(organization, warehouse, product, batch)` scope, including the aggregate null-batch scope, in global warehouse/product/batch order. Transfers lock source and destination scopes together before applying any movement.
+- Cost-bearing purchase visibility requires both `purchases.view` and `purchases.cost.view`, including support access through two exact active grants. The redacted journal continues to require only `purchases.view` and exposes no acquisition-cost fields.
+- A posted inventory document or transfer may move to `reversed` only by changing its status; cancelled and reversed records are terminal. Public inventory draft creation cannot create the internal `reversal` document type.
+- Purchase reversal builds a complete immutable counterpart graph: reversal lines, additional costs, allocations mapped to the new lines, matching header totals, opposite inventory movements, and unchanged original costs and allocations.
+- Raw `purchase_documents` header totals are cost-sensitive and require both `purchases.view` and `purchases.cost.view`. View-only users consume the redacted purchase journal, which omits header totals and all line, allocation, and batch acquisition costs; daily wrapper metadata uses a boolean metadata authorization helper and does not depend on raw header RLS.
+- Idempotency identity includes command type as well as operation key and payload hash. Purchase-draft payloads cover organization, branch, warehouse, counterparty, document number, business date, currency, and device, so changing currency or scope cannot replay another draft.
+- Purchase, transfer, and inventory reversals are fully idempotent: a matching successful command returns its original reversal entity before evaluating the now-reversed source state. Successful approved commands remain replayable after approval expiry, while new processing commands still require an unexpired approved request.
+- Historical purchase reversal validates its scope against the original purchase and does not depend on the supplier role still being active. New ordinary purchase drafts and postings continue to require an active supplier role.
 | `record_counterparty_goods_taken` | party, sale/inventory lines, settlement/op | settlements.goods_taken + sales/stock; locks balances/party | source document, stock movements, settlement entry, audit/outbox | document id; insufficient_stock, closed_period |
 | `close_settlement_period` | party, range, currency/context/op | settlements.close; lock party/open entries/period | period, attach entries, act/lines/hash, audit/outbox | act id/balance; overlapping_period, unposted_source |
 | `record_cash_movement` | shift, type, amount, reason/context/op | cash.move and optional approval; lock open shift | cash row, shift total, audit/outbox | movement id; shift_closed, approval_required |
@@ -2134,7 +2170,7 @@ Reconciliation jobs пишут result/cutoff, но не исправляют led
 | `0010_v2_catalog_compatibility.sql` | physical `categories_v2`, `brands_v2`, `units_v2`, `product_types_v2`, `products_v2`, barcodes/images/conversions | Legacy catalog untouched; nullable mappings, no backfill/views | 0009 | Duplicate mappings/barcodes; V1 UI/FK preserved |
 | `0011_v2_pricing.sql` | price lists/prices/requests/recommendations/history referencing `products_v2` | legacy products.sale_price retained | 0010 | One initial price; shadow compare |
 | `0012_v2_counterparties.sql` | parties/roles/contacts/addresses/credit | supplier/customer untouched | 0008 | Duplicate candidates/exceptions |
-| `0013_v2_purchases_inventory.sql` | purchase/inventory documents using `products_v2`, batches V2, ledgers/balances | Legacy documents keep FK to `public.products` | 0010–0012 | Synthetic doc rehearsal; stock reconciliation |
+| `0013_v2_purchases_inventory.sql` | purchase/inventory documents, warehouse transfers, physical `product_batches_v2`, ledgers/balances | Legacy `product_batches`/`stock_movements` and their FK remain untouched; no backfill/dual-write | 0010–0012 | Synthetic doc rehearsal; stock reconciliation |
 | `0014_v2_sales_payments.sql` | sales/lines/returns/held/payments/fiscal | V1 sales retained | 0011,0013 | Total/payment/stock tests |
 | `0015_v2_debts_settlements.sql` | receivables/allocations/settlement tables | V1 debts retained | 0012,0014 | Debt and party ledger reconciliation |
 | `0016_v2_shifts_cash.sql` | shifts/totals/cash ledger | V1 shifts retained | 0014 | Open shift conflicts/totals |
