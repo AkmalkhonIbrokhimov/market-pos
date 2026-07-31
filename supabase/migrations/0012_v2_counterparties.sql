@@ -19,6 +19,14 @@ insert into public.permission_profile_permissions(permission_profile_id,permissi
 select '00000000-0000-0000-0000-000000000102',id from public.permissions
 where code in('counterparties.customer.view','counterparties.customer.create','counterparties.credit.view')
 on conflict do nothing;
+-- seller_default was expanded; bump active assigned memberships once to invalidate permission caches.
+update public.organization_memberships om
+set permission_version=om.permission_version+1
+where om.status='active' and exists(
+ select 1 from public.membership_permission_profiles mpp
+ where mpp.membership_id=om.id
+ and mpp.permission_profile_id='00000000-0000-0000-0000-000000000102'::uuid
+);
 
 create table public.counterparties(
  id uuid primary key default gen_random_uuid(),
@@ -108,6 +116,24 @@ declare p record;begin select organization_id,status into p from public.counterp
  if p.status='archived' and tg_op='INSERT' then raise exception using errcode='P0001',message='V2_COUNTERPARTY_ARCHIVED_SCOPE';end if;
  if tg_op='UPDATE' and(new.id is distinct from old.id or new.organization_id is distinct from old.organization_id or new.counterparty_id is distinct from old.counterparty_id or new.created_at is distinct from old.created_at)
  then raise exception using errcode='P0001',message='V2_COUNTERPARTY_CHILD_IDENTITY_MUTATION_FORBIDDEN';end if;return new;end$$;
+create or replace function public.v2_guard_counterparty_contact() returns trigger language plpgsql set search_path='' as $$
+declare p record;begin select organization_id,status into p from public.counterparties where id=new.counterparty_id;
+ if p.organization_id is distinct from new.organization_id then raise exception using errcode='P0001',message='V2_COUNTERPARTY_CHILD_TENANT_MISMATCH';end if;
+ if p.status='archived' then raise exception using errcode='P0001',message='V2_COUNTERPARTY_ARCHIVED_SCOPE';end if;
+ if tg_op='UPDATE' then
+  if old.archived_at is not null then raise exception using errcode='P0001',message='V2_COUNTERPARTY_CONTACT_ARCHIVED_IMMUTABLE';end if;
+  if new.id is distinct from old.id or new.organization_id is distinct from old.organization_id or new.counterparty_id is distinct from old.counterparty_id or new.contact_type is distinct from old.contact_type or new.created_at is distinct from old.created_at
+  then raise exception using errcode='P0001',message='V2_COUNTERPARTY_CONTACT_IDENTITY_MUTATION_FORBIDDEN';end if;
+ end if;return new;end$$;
+create or replace function public.v2_guard_counterparty_address() returns trigger language plpgsql set search_path='' as $$
+declare p record;begin select organization_id,status into p from public.counterparties where id=new.counterparty_id;
+ if p.organization_id is distinct from new.organization_id then raise exception using errcode='P0001',message='V2_COUNTERPARTY_CHILD_TENANT_MISMATCH';end if;
+ if p.status='archived' then raise exception using errcode='P0001',message='V2_COUNTERPARTY_ARCHIVED_SCOPE';end if;
+ if tg_op='UPDATE' then
+  if old.archived_at is not null then raise exception using errcode='P0001',message='V2_COUNTERPARTY_ADDRESS_ARCHIVED_IMMUTABLE';end if;
+  if new.id is distinct from old.id or new.organization_id is distinct from old.organization_id or new.counterparty_id is distinct from old.counterparty_id or new.address_type is distinct from old.address_type or new.created_at is distinct from old.created_at
+  then raise exception using errcode='P0001',message='V2_COUNTERPARTY_ADDRESS_IDENTITY_MUTATION_FORBIDDEN';end if;
+ end if;return new;end$$;
 create or replace function public.v2_guard_counterparty_role() returns trigger language plpgsql set search_path='' as $$
 declare p record;begin select organization_id,status into p from public.counterparties where id=new.counterparty_id;
  if p.organization_id is distinct from new.organization_id then raise exception using errcode='P0001',message='V2_COUNTERPARTY_ROLE_TENANT_MISMATCH';end if;
@@ -133,10 +159,10 @@ create trigger v2_roles_context before insert or update on public.counterparty_r
 create trigger v2_roles_guard before insert or update on public.counterparty_roles for each row execute function public.v2_guard_counterparty_role();
 create trigger v2_roles_delete before delete on public.counterparty_roles for each row execute function public.v2_prevent_counterparty_delete();
 create trigger v2_contacts_context before insert or update on public.counterparty_contacts for each row execute function public.v2_counterparty_context_required();
-create trigger v2_contacts_guard before insert or update on public.counterparty_contacts for each row execute function public.v2_guard_counterparty_child();
+create trigger v2_contacts_guard before insert or update on public.counterparty_contacts for each row execute function public.v2_guard_counterparty_contact();
 create trigger v2_contacts_delete before delete on public.counterparty_contacts for each row execute function public.v2_prevent_counterparty_delete();
 create trigger v2_addresses_context before insert or update on public.counterparty_addresses for each row execute function public.v2_counterparty_context_required();
-create trigger v2_addresses_guard before insert or update on public.counterparty_addresses for each row execute function public.v2_guard_counterparty_child();
+create trigger v2_addresses_guard before insert or update on public.counterparty_addresses for each row execute function public.v2_guard_counterparty_address();
 create trigger v2_addresses_delete before delete on public.counterparty_addresses for each row execute function public.v2_prevent_counterparty_delete();
 create trigger v2_credit_context before insert or update on public.counterparty_credit_settings for each row execute function public.v2_counterparty_context_required();
 create trigger v2_credit_guard before insert or update on public.counterparty_credit_settings for each row execute function public.v2_guard_counterparty_credit();
@@ -172,9 +198,41 @@ create or replace function public.v2_end_counterparty_role(i uuid) returns void 
 declare o uuid;p uuid;a uuid;begin select organization_id,counterparty_id into o,p from public.counterparty_roles where id=i;a:=public.v2_current_membership_id(o);if a is null or not public.v2_has_permission(o,'counterparties.manage',null)then raise exception using errcode='P0001',message='V2_COUNTERPARTIES_MANAGE_REQUIRED';end if;perform set_config('market_pos.counterparty_command','on',true);update public.counterparty_roles set ended_at=clock_timestamp() where id=i;perform public.v2_emit_counterparty_event(o,a,p,'counterparty.role_ended','CounterpartyRoleEnded',jsonb_build_object('counterparty_id',p,'role_id',i));perform set_config('market_pos.counterparty_command','off',true);end$$;
 
 create or replace function public.v2_upsert_counterparty_contact(i uuid,p uuid,ct text,v text,l text,pr boolean,ar boolean default false) returns uuid language plpgsql security definer set search_path='' as $$
-declare o uuid;a uuid;x uuid:=coalesce(i,gen_random_uuid());begin select organization_id into o from public.counterparties where id=p;a:=public.v2_current_membership_id(o);if a is null or not public.v2_has_permission(o,'counterparties.manage',null)then raise exception using errcode='P0001',message='V2_COUNTERPARTIES_MANAGE_REQUIRED';end if;perform set_config('market_pos.counterparty_command','on',true);insert into public.counterparty_contacts(id,organization_id,counterparty_id,contact_type,value,label,is_primary,archived_at)values(x,o,p,ct,v,l,pr,case when ar then clock_timestamp() end)on conflict(id)do update set value=excluded.value,label=excluded.label,is_primary=excluded.is_primary,archived_at=excluded.archived_at;perform public.v2_emit_counterparty_event(o,a,p,'counterparty.changed','CounterpartyChanged',jsonb_build_object('counterparty_id',p));perform set_config('market_pos.counterparty_command','off',true);return x;end$$;
+declare o uuid;a uuid;x uuid;ps text;e public.counterparty_contacts%rowtype;begin
+ select organization_id,status into o,ps from public.counterparties where id=p;if not found then raise exception using errcode='P0001',message='V2_COUNTERPARTY_NOT_FOUND';end if;
+ a:=public.v2_current_membership_id(o);if a is null or not public.v2_has_permission(o,'counterparties.manage',null)then raise exception using errcode='P0001',message='V2_COUNTERPARTIES_MANAGE_REQUIRED';end if;
+ if ps='archived' then raise exception using errcode='P0001',message='V2_COUNTERPARTY_ARCHIVED_SCOPE';end if;
+ perform set_config('market_pos.counterparty_command','on',true);
+ if i is null then
+  if ar then raise exception using errcode='P0001',message='V2_COUNTERPARTY_CONTACT_ARCHIVE_REQUIRES_EXISTING';end if;x:=gen_random_uuid();
+  insert into public.counterparty_contacts(id,organization_id,counterparty_id,contact_type,value,label,is_primary)values(x,o,p,ct,v,l,pr);
+ else
+  select * into e from public.counterparty_contacts where id=i for update;if not found then raise exception using errcode='P0001',message='V2_COUNTERPARTY_CONTACT_NOT_FOUND';end if;
+  if e.organization_id is distinct from o or e.counterparty_id is distinct from p then raise exception using errcode='P0001',message='V2_COUNTERPARTY_CONTACT_SCOPE_MISMATCH';end if;
+  if e.contact_type is distinct from ct then raise exception using errcode='P0001',message='V2_COUNTERPARTY_CONTACT_TYPE_MUTATION_FORBIDDEN';end if;
+  if e.archived_at is not null then raise exception using errcode='P0001',message='V2_COUNTERPARTY_CONTACT_ARCHIVED_IMMUTABLE';end if;x:=e.id;
+  if ar then update public.counterparty_contacts set archived_at=clock_timestamp(),is_primary=false where id=e.id;
+  else update public.counterparty_contacts set value=v,label=l,is_primary=pr where id=e.id;end if;
+ end if;
+ perform public.v2_emit_counterparty_event(o,a,p,'counterparty.changed','CounterpartyChanged',jsonb_build_object('counterparty_id',p));perform set_config('market_pos.counterparty_command','off',true);return x;end$$;
 create or replace function public.v2_upsert_counterparty_address(i uuid,p uuid,at text,v text,m jsonb,pr boolean,ar boolean default false) returns uuid language plpgsql security definer set search_path='' as $$
-declare o uuid;a uuid;x uuid:=coalesce(i,gen_random_uuid());begin select organization_id into o from public.counterparties where id=p;a:=public.v2_current_membership_id(o);if a is null or not public.v2_has_permission(o,'counterparties.manage',null)then raise exception using errcode='P0001',message='V2_COUNTERPARTIES_MANAGE_REQUIRED';end if;perform set_config('market_pos.counterparty_command','on',true);insert into public.counterparty_addresses(id,organization_id,counterparty_id,address_type,address_text,metadata,is_primary,archived_at)values(x,o,p,at,v,m,pr,case when ar then clock_timestamp() end)on conflict(id)do update set address_text=excluded.address_text,metadata=excluded.metadata,is_primary=excluded.is_primary,archived_at=excluded.archived_at;perform public.v2_emit_counterparty_event(o,a,p,'counterparty.changed','CounterpartyChanged',jsonb_build_object('counterparty_id',p));perform set_config('market_pos.counterparty_command','off',true);return x;end$$;
+declare o uuid;a uuid;x uuid;ps text;e public.counterparty_addresses%rowtype;begin
+ select organization_id,status into o,ps from public.counterparties where id=p;if not found then raise exception using errcode='P0001',message='V2_COUNTERPARTY_NOT_FOUND';end if;
+ a:=public.v2_current_membership_id(o);if a is null or not public.v2_has_permission(o,'counterparties.manage',null)then raise exception using errcode='P0001',message='V2_COUNTERPARTIES_MANAGE_REQUIRED';end if;
+ if ps='archived' then raise exception using errcode='P0001',message='V2_COUNTERPARTY_ARCHIVED_SCOPE';end if;
+ perform set_config('market_pos.counterparty_command','on',true);
+ if i is null then
+  if ar then raise exception using errcode='P0001',message='V2_COUNTERPARTY_ADDRESS_ARCHIVE_REQUIRES_EXISTING';end if;x:=gen_random_uuid();
+  insert into public.counterparty_addresses(id,organization_id,counterparty_id,address_type,address_text,metadata,is_primary)values(x,o,p,at,v,m,pr);
+ else
+  select * into e from public.counterparty_addresses where id=i for update;if not found then raise exception using errcode='P0001',message='V2_COUNTERPARTY_ADDRESS_NOT_FOUND';end if;
+  if e.organization_id is distinct from o or e.counterparty_id is distinct from p then raise exception using errcode='P0001',message='V2_COUNTERPARTY_ADDRESS_SCOPE_MISMATCH';end if;
+  if e.address_type is distinct from at then raise exception using errcode='P0001',message='V2_COUNTERPARTY_ADDRESS_TYPE_MUTATION_FORBIDDEN';end if;
+  if e.archived_at is not null then raise exception using errcode='P0001',message='V2_COUNTERPARTY_ADDRESS_ARCHIVED_IMMUTABLE';end if;x:=e.id;
+  if ar then update public.counterparty_addresses set archived_at=clock_timestamp(),is_primary=false where id=e.id;
+  else update public.counterparty_addresses set address_text=v,metadata=m,is_primary=pr where id=e.id;end if;
+ end if;
+ perform public.v2_emit_counterparty_event(o,a,p,'counterparty.changed','CounterpartyChanged',jsonb_build_object('counterparty_id',p));perform set_config('market_pos.counterparty_command','off',true);return x;end$$;
 create or replace function public.v2_set_counterparty_credit_settings(p uuid,e boolean,lim numeric,d integer,cur char(3)) returns void language plpgsql security definer set search_path='' as $$
 declare o uuid;a uuid;begin select organization_id into o from public.counterparties where id=p;a:=public.v2_current_membership_id(o);if a is null or not public.v2_has_permission(o,'counterparties.credit.manage',null)then raise exception using errcode='P0001',message='V2_COUNTERPARTY_CREDIT_MANAGE_REQUIRED';end if;perform set_config('market_pos.counterparty_command','on',true);insert into public.counterparty_credit_settings(counterparty_id,organization_id,credit_enabled,credit_limit_amount,max_due_days,currency_code,updated_by)values(p,o,e,lim,d,cur,a)on conflict(counterparty_id)do update set credit_enabled=excluded.credit_enabled,credit_limit_amount=excluded.credit_limit_amount,max_due_days=excluded.max_due_days,currency_code=excluded.currency_code,updated_by=excluded.updated_by,updated_at=now();perform public.v2_emit_counterparty_event(o,a,p,'credit_terms.changed','CreditTermsChanged',jsonb_build_object('counterparty_id',p));perform set_config('market_pos.counterparty_command','off',true);end$$;
 create or replace function public.v2_archive_counterparty(p uuid) returns void language plpgsql security definer set search_path='' as $$
@@ -189,7 +247,7 @@ create policy counterparty_credit_select on public.counterparty_credit_settings 
 revoke all on public.counterparties,public.counterparty_roles,public.counterparty_contacts,public.counterparty_addresses,public.counterparty_credit_settings from anon,authenticated;
 grant select on public.counterparties,public.counterparty_roles,public.counterparty_contacts,public.counterparty_addresses,public.counterparty_credit_settings to authenticated;
 
-revoke execute on function public.v2_counterparty_context_required(),public.v2_prevent_counterparty_delete(),public.v2_guard_counterparty(),public.v2_guard_counterparty_child(),public.v2_guard_counterparty_role(),public.v2_guard_counterparty_credit(),public.v2_emit_counterparty_event(uuid,uuid,uuid,text,text,jsonb) from public,anon,authenticated;
+revoke execute on function public.v2_counterparty_context_required(),public.v2_prevent_counterparty_delete(),public.v2_guard_counterparty(),public.v2_guard_counterparty_child(),public.v2_guard_counterparty_contact(),public.v2_guard_counterparty_address(),public.v2_guard_counterparty_role(),public.v2_guard_counterparty_credit(),public.v2_emit_counterparty_event(uuid,uuid,uuid,text,text,jsonb) from public,anon,authenticated;
 revoke execute on function public.v2_can_view_counterparty(uuid,uuid),public.v2_can_view_counterparty_credit(uuid,uuid) from public,anon;grant execute on function public.v2_can_view_counterparty(uuid,uuid),public.v2_can_view_counterparty_credit(uuid,uuid) to authenticated;
 revoke execute on function public.v2_create_counterparty(uuid,text,text,text,text,boolean,boolean,uuid,uuid),public.v2_create_quick_customer(uuid,text,text),public.v2_update_counterparty(uuid,text,text,text,text,text),public.v2_add_counterparty_role(uuid,text),public.v2_end_counterparty_role(uuid),public.v2_upsert_counterparty_contact(uuid,uuid,text,text,text,boolean,boolean),public.v2_upsert_counterparty_address(uuid,uuid,text,text,jsonb,boolean,boolean),public.v2_set_counterparty_credit_settings(uuid,boolean,numeric,integer,character),public.v2_archive_counterparty(uuid) from public,anon;
 grant execute on function public.v2_create_counterparty(uuid,text,text,text,text,boolean,boolean,uuid,uuid),public.v2_create_quick_customer(uuid,text,text),public.v2_update_counterparty(uuid,text,text,text,text,text),public.v2_add_counterparty_role(uuid,text),public.v2_end_counterparty_role(uuid),public.v2_upsert_counterparty_contact(uuid,uuid,text,text,text,boolean,boolean),public.v2_upsert_counterparty_address(uuid,uuid,text,text,jsonb,boolean,boolean),public.v2_set_counterparty_credit_settings(uuid,boolean,numeric,integer,character),public.v2_archive_counterparty(uuid) to authenticated;

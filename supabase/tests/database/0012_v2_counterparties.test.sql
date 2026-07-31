@@ -1,7 +1,7 @@
 begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path=public,extensions;
-select plan(254);
+select plan(282);
 
 select has_table('public',t,t||' exists') from(values
 ('counterparties'),('counterparty_roles'),('counterparty_contacts'),('counterparty_addresses'),('counterparty_credit_settings'),
@@ -67,17 +67,26 @@ select is((select count(*) from supabase_migrations.schema_migrations where vers
 insert into auth.users(instance_id,id,aud,role,email,encrypted_password,email_confirmed_at,created_at,updated_at)values
 ('00000000-0000-0000-0000-000000000000','00000000-0000-0000-0000-000000012001','authenticated','authenticated','o12@test','','now','now','now'),
 ('00000000-0000-0000-0000-000000000000','00000000-0000-0000-0000-000000012002','authenticated','authenticated','s12@test','','now','now','now'),
-('00000000-0000-0000-0000-000000000000','00000000-0000-0000-0000-000000012003','authenticated','authenticated','x12@test','','now','now','now');
+('00000000-0000-0000-0000-000000000000','00000000-0000-0000-0000-000000012003','authenticated','authenticated','x12@test','','now','now','now'),
+('00000000-0000-0000-0000-000000000000','00000000-0000-0000-0000-000000012004','authenticated','authenticated','inactive12@test','','now','now','now');
 insert into organizations(id,name)values('00000000-0000-0000-0000-000000012101','A12'),('00000000-0000-0000-0000-000000012102','B12');
 insert into stores(id,organization_id,name)values('00000000-0000-0000-0000-000000012111','00000000-0000-0000-0000-000000012101','SA'),('00000000-0000-0000-0000-000000012112','00000000-0000-0000-0000-000000012102','SB');
 insert into suppliers(id,organization_id,name)values('00000000-0000-0000-0000-000000012121','00000000-0000-0000-0000-000000012101','SupA'),('00000000-0000-0000-0000-000000012122','00000000-0000-0000-0000-000000012102','SupB');
 insert into customers(id,store_id,full_name)values('00000000-0000-0000-0000-000000012131','00000000-0000-0000-0000-000000012111','CusA'),('00000000-0000-0000-0000-000000012132','00000000-0000-0000-0000-000000012112','CusB');
-insert into user_profiles(id,auth_user_id,full_name)values('00000000-0000-0000-0000-000000012201','00000000-0000-0000-0000-000000012001','Owner'),('00000000-0000-0000-0000-000000012202','00000000-0000-0000-0000-000000012002','Seller'),('00000000-0000-0000-0000-000000012203','00000000-0000-0000-0000-000000012003','Service');
+insert into user_profiles(id,auth_user_id,full_name)values('00000000-0000-0000-0000-000000012201','00000000-0000-0000-0000-000000012001','Owner'),('00000000-0000-0000-0000-000000012202','00000000-0000-0000-0000-000000012002','Seller'),('00000000-0000-0000-0000-000000012203','00000000-0000-0000-0000-000000012003','Service'),('00000000-0000-0000-0000-000000012204','00000000-0000-0000-0000-000000012004','Inactive');
 insert into organization_memberships(id,organization_id,user_profile_id,system_role,status,joined_at)values
 ('00000000-0000-0000-0000-000000012301','00000000-0000-0000-0000-000000012101','00000000-0000-0000-0000-000000012201','owner','active',now()),
 ('00000000-0000-0000-0000-000000012302','00000000-0000-0000-0000-000000012101','00000000-0000-0000-0000-000000012202','seller','active',now()),
-('00000000-0000-0000-0000-000000012303','00000000-0000-0000-0000-000000012101','00000000-0000-0000-0000-000000012203','service_admin','active',now());
-insert into membership_permission_profiles(membership_id,permission_profile_id,assigned_by)values('00000000-0000-0000-0000-000000012302','00000000-0000-0000-0000-000000000102','00000000-0000-0000-0000-000000012301');
+('00000000-0000-0000-0000-000000012303','00000000-0000-0000-0000-000000012101','00000000-0000-0000-0000-000000012203','service_admin','active',now()),
+('00000000-0000-0000-0000-000000012304','00000000-0000-0000-0000-000000012101','00000000-0000-0000-0000-000000012204','seller','inactive',null);
+insert into membership_permission_profiles(membership_id,permission_profile_id,assigned_by)values
+('00000000-0000-0000-0000-000000012302','00000000-0000-0000-0000-000000000102','00000000-0000-0000-0000-000000012301'),
+('00000000-0000-0000-0000-000000012304','00000000-0000-0000-0000-000000000102','00000000-0000-0000-0000-000000012301');
+select is((select count(*) from permission_profile_permissions ppp join permissions p on p.id=ppp.permission_id where ppp.permission_profile_id='00000000-0000-0000-0000-000000000102' and p.code in('counterparties.customer.view','counterparties.customer.create','counterparties.credit.view')),3::bigint,'seller cache set has three permissions');
+update organization_memberships om set permission_version=om.permission_version+1 where om.status='active' and exists(select 1 from membership_permission_profiles mpp where mpp.membership_id=om.id and mpp.permission_profile_id='00000000-0000-0000-0000-000000000102');
+select is((select permission_version from organization_memberships where id='00000000-0000-0000-0000-000000012302'),3::bigint,'active seller cache version bumped once by path');
+select is((select permission_version from organization_memberships where id='00000000-0000-0000-0000-000000012301'),1::bigint,'membership without seller default unchanged');
+select is((select permission_version from organization_memberships where id='00000000-0000-0000-0000-000000012304'),2::bigint,'inactive seller membership unchanged by cache path');
 
 select throws_ok($$insert into counterparties(organization_id,display_name)values('00000000-0000-0000-0000-000000012101','Direct')$$,'P0001','V2_COUNTERPARTY_COMMAND_CONTEXT_REQUIRED','direct party denied');
 select throws_ok($$insert into counterparty_roles(organization_id,counterparty_id,role_code)values('00000000-0000-0000-0000-000000012101',gen_random_uuid(),'customer')$$,'P0001','V2_COUNTERPARTY_COMMAND_CONTEXT_REQUIRED','direct role denied');
@@ -162,6 +171,55 @@ select ok((select count(*) from counterparties)>0,'exact support view grant work
 select throws_ok($$select v2_create_quick_customer('00000000-0000-0000-0000-000000012101','Support Bad',null)$$,'P0001','V2_COUNTERPARTY_CUSTOMER_CREATE_REQUIRED','support grant gives no writes');
 reset role;
 select throws_ok($$delete from counterparties where display_name='Null1'$$,'P0001','V2_COUNTERPARTY_HARD_DELETE_FORBIDDEN','hard delete denied');
+
+-- Scope-safe child command fixtures.
+select set_config('market_pos.counterparty_command','on',true);
+insert into counterparties(id,organization_id,display_name)values
+('00000000-0000-0000-0000-000000012501','00000000-0000-0000-0000-000000012101','Scope A'),
+('00000000-0000-0000-0000-000000012502','00000000-0000-0000-0000-000000012102','Scope B'),
+('00000000-0000-0000-0000-000000012503','00000000-0000-0000-0000-000000012101','Scope A2');
+insert into counterparty_contacts(id,organization_id,counterparty_id,contact_type,value)values
+('00000000-0000-0000-0000-000000012601','00000000-0000-0000-0000-000000012101','00000000-0000-0000-0000-000000012501','phone','A-old'),
+('00000000-0000-0000-0000-000000012602','00000000-0000-0000-0000-000000012102','00000000-0000-0000-0000-000000012502','phone','B-old'),
+('00000000-0000-0000-0000-000000012603','00000000-0000-0000-0000-000000012101','00000000-0000-0000-0000-000000012503','phone','A2-old');
+insert into counterparty_addresses(id,organization_id,counterparty_id,address_type,address_text)values
+('00000000-0000-0000-0000-000000012701','00000000-0000-0000-0000-000000012101','00000000-0000-0000-0000-000000012501','delivery','A-old'),
+('00000000-0000-0000-0000-000000012702','00000000-0000-0000-0000-000000012102','00000000-0000-0000-0000-000000012502','delivery','B-old'),
+('00000000-0000-0000-0000-000000012703','00000000-0000-0000-0000-000000012101','00000000-0000-0000-0000-000000012503','delivery','A2-old');
+select set_config('market_pos.counterparty_command','off',true);
+
+select set_config('request.jwt.claim.sub','00000000-0000-0000-0000-000000012001',true);set local role authenticated;
+select throws_ok($$select v2_upsert_counterparty_contact('00000000-0000-0000-0000-000000012602','00000000-0000-0000-0000-000000012501','phone','hacked',null,false,false)$$,'P0001','V2_COUNTERPARTY_CONTACT_SCOPE_MISMATCH','cross-tenant contact id attack denied');
+reset role;
+select is((select value from counterparty_contacts where id='00000000-0000-0000-0000-000000012602'),'B-old','contact B unchanged');
+select is((select count(*) from audit_events where entity_id='00000000-0000-0000-0000-000000012501'),0::bigint,'failed contact attack creates no audit');
+select is((select count(*) from outbox_events where aggregate_id='00000000-0000-0000-0000-000000012501'),0::bigint,'failed contact attack creates no outbox');
+set local role authenticated;
+select throws_ok($$select v2_upsert_counterparty_contact('00000000-0000-0000-0000-000000012603','00000000-0000-0000-0000-000000012501','phone','hacked',null,false,false)$$,'P0001','V2_COUNTERPARTY_CONTACT_SCOPE_MISMATCH','same-tenant cross-party contact denied');
+select throws_ok($$select v2_upsert_counterparty_contact('00000000-0000-0000-0000-000000012601','00000000-0000-0000-0000-000000012501','email','x',null,false,false)$$,'P0001','V2_COUNTERPARTY_CONTACT_TYPE_MUTATION_FORBIDDEN','contact type immutable');
+select lives_ok($$select v2_upsert_counterparty_contact('00000000-0000-0000-0000-000000012601','00000000-0000-0000-0000-000000012501','phone','A-new','main',true,false)$$,'contact update works');
+select lives_ok($$select v2_upsert_counterparty_contact('00000000-0000-0000-0000-000000012601','00000000-0000-0000-0000-000000012501','phone','ignored',null,true,true)$$,'contact archive works');
+select throws_ok($$select v2_upsert_counterparty_contact('00000000-0000-0000-0000-000000012601','00000000-0000-0000-0000-000000012501','phone','restore',null,false,false)$$,'P0001','V2_COUNTERPARTY_CONTACT_ARCHIVED_IMMUTABLE','archived contact immutable');
+select throws_ok($$select v2_upsert_counterparty_contact('00000000-0000-0000-0000-000000012601','00000000-0000-0000-0000-000000012501','phone','restore',null,false,true)$$,'P0001','V2_COUNTERPARTY_CONTACT_ARCHIVED_IMMUTABLE','archived contact cannot restore');
+select throws_ok($$select v2_upsert_counterparty_contact(null,'00000000-0000-0000-0000-000000012501','phone','bad',null,false,true)$$,'P0001','V2_COUNTERPARTY_CONTACT_ARCHIVE_REQUIRES_EXISTING','contact cannot create archived');
+
+select throws_ok($$select v2_upsert_counterparty_address('00000000-0000-0000-0000-000000012702','00000000-0000-0000-0000-000000012501','delivery','hacked','{}',false,false)$$,'P0001','V2_COUNTERPARTY_ADDRESS_SCOPE_MISMATCH','cross-tenant address id attack denied');
+reset role;
+select is((select address_text from counterparty_addresses where id='00000000-0000-0000-0000-000000012702'),'B-old','address B unchanged');
+set local role authenticated;
+select throws_ok($$select v2_upsert_counterparty_address('00000000-0000-0000-0000-000000012703','00000000-0000-0000-0000-000000012501','delivery','hacked','{}',false,false)$$,'P0001','V2_COUNTERPARTY_ADDRESS_SCOPE_MISMATCH','same-tenant cross-party address denied');
+select throws_ok($$select v2_upsert_counterparty_address('00000000-0000-0000-0000-000000012701','00000000-0000-0000-0000-000000012501','legal','x','{}',false,false)$$,'P0001','V2_COUNTERPARTY_ADDRESS_TYPE_MUTATION_FORBIDDEN','address type immutable');
+select lives_ok($$select v2_upsert_counterparty_address('00000000-0000-0000-0000-000000012701','00000000-0000-0000-0000-000000012501','delivery','A-new','{"city":"T"}',true,false)$$,'address update works');
+select lives_ok($$select v2_upsert_counterparty_address('00000000-0000-0000-0000-000000012701','00000000-0000-0000-0000-000000012501','delivery','ignored','{}',true,true)$$,'address archive works');
+select throws_ok($$select v2_upsert_counterparty_address('00000000-0000-0000-0000-000000012701','00000000-0000-0000-0000-000000012501','delivery','restore','{}',false,false)$$,'P0001','V2_COUNTERPARTY_ADDRESS_ARCHIVED_IMMUTABLE','archived address immutable');
+select throws_ok($$select v2_upsert_counterparty_address('00000000-0000-0000-0000-000000012701','00000000-0000-0000-0000-000000012501','delivery','restore','{}',false,true)$$,'P0001','V2_COUNTERPARTY_ADDRESS_ARCHIVED_IMMUTABLE','archived address cannot restore');
+select throws_ok($$select v2_upsert_counterparty_address(null,'00000000-0000-0000-0000-000000012501','delivery','bad','{}',false,true)$$,'P0001','V2_COUNTERPARTY_ADDRESS_ARCHIVE_REQUIRES_EXISTING','address cannot create archived');
+
+select throws_ok(format('select v2_upsert_counterparty_contact(null,%L,%L,%L,null,false,false)',(select id from counterparties where display_name='Dual'),'phone','blocked'),'P0001','V2_COUNTERPARTY_ARCHIVED_SCOPE','archived party blocks contact create');
+select throws_ok(format('select v2_upsert_counterparty_address(null,%L,%L,%L,%L::jsonb,false,false)',(select id from counterparties where display_name='Dual'),'other','blocked','{}'),'P0001','V2_COUNTERPARTY_ARCHIVED_SCOPE','archived party blocks address create');
+select throws_ok(format('select v2_upsert_counterparty_contact(%L,%L,%L,%L,null,false,false)',(select c.id from counterparty_contacts c join counterparties p on p.id=c.counterparty_id where p.display_name='Dual' limit 1),(select id from counterparties where display_name='Dual'),'email','blocked'),'P0001','V2_COUNTERPARTY_ARCHIVED_SCOPE','archived party blocks contact update');
+select throws_ok(format('select v2_upsert_counterparty_address(%L,%L,%L,%L,%L::jsonb,false,false)',(select a.id from counterparty_addresses a join counterparties p on p.id=a.counterparty_id where p.display_name='Dual' limit 1),(select id from counterparties where display_name='Dual'),'delivery','blocked','{}'),'P0001','V2_COUNTERPARTY_ARCHIVED_SCOPE','archived party blocks address update');
+reset role;
 
 select * from finish();
 rollback;
