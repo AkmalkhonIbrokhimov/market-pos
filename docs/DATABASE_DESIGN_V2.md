@@ -808,6 +808,45 @@ Partial unique active `(counterparty_id,role_code)`. Checks role code.
 
 Checks nonnegative. Partial unique primary contacts/addresses. Index normalized contact value for customer lookup.
 
+### Counterparties authorization и coexistence
+
+Физические имена `public.counterparties`, `counterparty_roles`,
+`counterparty_contacts`, `counterparty_addresses` и
+`counterparty_credit_settings` свободны и используются без суффикса `_v2`.
+Legacy `suppliers` и `customers` остаются неизменными; nullable unique mappings
+`legacy_supplier_id` и `legacy_customer_id` не заполняются автоматически.
+Существующие FK `product_batches → suppliers` и
+`sales/debt_entries/debt_payments → customers` сохраняются. Migration 0013
+ссылается только на `public.counterparties`; backfill, reconciliation и cutover
+выполняются в migrations 0019–0020.
+
+Permission registry модуля `counterparties` содержит:
+`counterparties.view`, `counterparties.manage`,
+`counterparties.customer.view`, `counterparties.customer.create`,
+`counterparties.credit.view` и `counterparties.credit.manage`. Owner template
+получает все шесть прав. Seller template получает только customer view/create и
+credit view: seller видит customer parties, только customer role и связанные
+contacts/addresses, но не supplier-only directory. Credit policy отделена от
+обычных debt overrides. Расширение `seller_default` увеличивает
+`permission_version` ровно на один для active memberships с этим template,
+инвалидируя offline/client permission cache; inactive и несвязанные memberships
+не изменяются.
+
+Все runtime mutations выполняются security-definer RPC внутри
+transaction-local `market_pos.counterparty_command`; direct browser и trusted
+backend table writes без context запрещены. POS quick customer принимает только
+display name и optional phone, создаёт только customer role и не принимает
+supplier role, tax/legal data, notes, credit policy или legacy mappings.
+Support grants дают только exact-scope SELECT и никогда не разрешают mutation
+RPC.
+
+Contact/address RPC проверяют переданный child id вместе с organization и
+counterparty parent под row lock; cross-tenant и cross-party id substitution
+запрещены. `contact_type` и `address_type` immutable. Archived children terminal,
+а archived counterparty не допускает child create/update. Команды не используют
+cross-scope `ON CONFLICT(id) DO UPDATE`; archive является односторонним controlled
+переходом и не допускает восстановления.
+
 ## 34. Документы закупки
 
 ### `purchase_documents`
