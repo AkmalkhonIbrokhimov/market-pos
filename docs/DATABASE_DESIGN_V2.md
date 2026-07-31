@@ -2162,6 +2162,49 @@ Reconciliation jobs пишут result/cutoff, но не исправляют led
 
 Файлы предлагаются, но на этом этапе не создаются.
 
+### Реализованный контракт migration 0014
+
+В период coexistence концептуальные Sales, Payments и Shifts физически
+реализованы таблицами `public.sales_v2`, `public.payments_v2` и
+`public.shifts_v2`. Legacy `public.sales`, `public.sale_items`,
+`public.payments` и `public.shifts` остаются неизменными; backfill, dual-write
+и compatibility views в 0014 отсутствуют.
+
+`sales.cost.view` отделяет raw cost surface от обычного `sales.view`.
+`sale_lines_v2.unit_cost`, batch allocations и расчёт gross margin доступны
+только при наличии обоих прав; seller использует redacted read helper без
+себестоимости и margin. В constraint назначения `sales.discount` хранится
+`max_discount_percent`: owner system role имеет 100, корректные значения
+custom profiles агрегируются максимумом в диапазоне 0..100, а отсутствующее,
+нечисловое или выходящее за диапазон значение трактуется как 0. Любая скидка
+выше effective limit требует approved critical command
+`sales.discount.override`.
+
+0014 извлекает минимальный operational shift contract: открытие/закрытие
+`shifts_v2` и signed projection `shift_totals` по методам `cash`, `card`,
+`transfer`. Расширенные cash movements, ручные cash in/out, denomination
+counting, discrepancy approvals и cash reports остаются ответственностью
+0016. До 0015 продажа всегда полностью оплачена (`paid_amount = total_amount`,
+`debt_amount = 0`); попытка продажи в долг отклоняется стабильной ошибкой.
+
+Online `post_sale` выбирает active branch-default price list, затем active
+organization-default fallback, проверяет price/currency/effective interval и
+не использует legacy `products.sale_price`. Stock allocation выполняется FEFO
+по положительным open batch balances (`expiration NULLS LAST`, received date,
+batch UUID), сохраняет immutable unit-cost snapshots и не допускает negative
+POS sale даже при `allow_negative_stock`. Один return line может восстановить
+несколько исходных batches; source identity inventory movement поэтому
+включает batch с `NULLS NOT DISTINCT`.
+
+`registers.settings.fiscal` принимает только ключи `mode`, `provider_code`,
+`offline_policy`. Отсутствующий object означает disabled/null/reject;
+`required` требует provider и reject, `deferred` — provider и defer. Posting
+атомарно создаёт pending/deferred fiscal intent и outbox event, но не вызывает
+provider. Worker lifecycle `pending|failed|deferred → processing →
+issued|failed|deferred` защищён processing token и append-only attempts;
+provider adapters остаются вне 0014. Прямой online post реализован сейчас,
+offline envelope processing остаётся в 0017.
+
 | Migration | Ответственность и таблицы | Legacy changes | Dependencies / compatibility | Pre/post checks и forward recovery |
 | --- | --- | --- | --- | --- |
 | `0007_v2_foundation.sql` | command_log, outbox, audit, migration exceptions, helpers | Нет | 0001–0006; additive | Extensions/types/grants; fix forward new migration |
@@ -2171,9 +2214,9 @@ Reconciliation jobs пишут result/cutoff, но не исправляют led
 | `0011_v2_pricing.sql` | price lists/prices/requests/recommendations/history referencing `products_v2` | legacy products.sale_price retained | 0010 | One initial price; shadow compare |
 | `0012_v2_counterparties.sql` | parties/roles/contacts/addresses/credit | supplier/customer untouched | 0008 | Duplicate candidates/exceptions |
 | `0013_v2_purchases_inventory.sql` | purchase/inventory documents, warehouse transfers, physical `product_batches_v2`, ledgers/balances | Legacy `product_batches`/`stock_movements` and their FK remain untouched; no backfill/dual-write | 0010–0012 | Synthetic doc rehearsal; stock reconciliation |
-| `0014_v2_sales_payments.sql` | sales/lines/returns/held/payments/fiscal | V1 sales retained | 0011,0013 | Total/payment/stock tests |
+| `0014_v2_sales_payments.sql` | physical `sales_v2`, lines/allocations, returns, held sales, `payments_v2`, minimal `shifts_v2`/totals, fiscal intents/attempts | V1 sales/payments/shifts retained; no backfill or dual-write | 0011,0013 | Fully-paid totals, FEFO, signed payments, fiscal intent, raw-cost RLS |
 | `0015_v2_debts_settlements.sql` | receivables/allocations/settlement tables | V1 debts retained | 0012,0014 | Debt and party ledger reconciliation |
-| `0016_v2_shifts_cash.sql` | shifts/totals/cash ledger | V1 shifts retained | 0014 | Open shift conflicts/totals |
+| `0016_v2_shifts_cash.sql` | cash movements, manual cash in/out, denominations/counting, discrepancy approvals and operational cash reports | V1 shifts retained; minimal V2 shifts already in 0014 | 0014 | Cash-ledger reconciliation and discrepancy controls |
 | `0017_v2_sync_audit_outbox.sql` | sync commands, final event plumbing | sync_operations retained | all domain commands stable | Retry/idempotency/outbox tests |
 | `0018_v2_rls.sql` | RLS helpers, policies, grants, defensive triggers | Revoke unsafe V2 grants only | tables/backfill helpers | Role matrix and cross-tenant test suite |
 | `0019_v2_backfill.sql` | idempotent backfill procedures/checkpoints | Reads V1, writes V2 | 0007–0018 | Dry run, exceptions, restartability |
