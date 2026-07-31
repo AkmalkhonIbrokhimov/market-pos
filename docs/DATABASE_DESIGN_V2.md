@@ -2205,6 +2205,42 @@ issued|failed|deferred` защищён processing token и append-only attempts;
 provider adapters остаются вне 0014. Прямой online post реализован сейчас,
 offline envelope processing остаётся в 0017.
 
+Review hardening фиксирует current-shift reversal contract. Sale reversal и
+sale-return reversal принимают явный `current_shift_id`: текущая смена должна
+быть open, относиться к тем же organization/branch/register, а device — быть
+trusted для этого register. Seller использует только собственную смену;
+owner — любую авторизованную смену branch. Поэтому reversal разрешён после
+закрытия исторической original shift, но новые payments, `shift_totals` и
+fiscal intent всегда относятся к current shift. Inventory scopes (batch и
+aggregate NULL batch) блокируются глобально до первой mutation, а opposite
+movements содержат `reversal_of_id` исходного движения.
+
+Active ordinary return определяется строго как `status = 'posted' AND
+reversal_of_id IS NULL`. Только такие документы входят в cumulative quantity,
+refund, per-batch capacity и sale lifecycle. Reversal возврата создаёт
+отдельный header/lines, отрицательные inventory movements и положительные
+payments, ссылающиеся на исходные refund rows; original return становится
+`reversed`, после чего единый helper пересчитывает sale в
+`posted|partially_returned|returned`. Historical customer snapshot разрешён
+только controlled sale reversal; обычная новая sale по-прежнему требует
+active customer role. Return headers/lines, allocations и payments защищены
+строгими lifecycle/append-only guards.
+
+Shift RLS использует `v2_can_view_shift`: seller видит только свои shifts и
+totals, owner — авторизованный branch, support — только exact active
+`sales.view` grant. Raw `fiscal_documents` и diagnostic attempts доступны
+только owner/support. Seller получает безопасный статус через
+`v2_fiscal_status_for_sale` или `v2_fiscal_status_for_return`; RPC не раскрывают
+provider, idempotency/processing tokens, fiscal sign, response payload или
+ошибки.
+
+Fiscal worker не имеет прямых table writes и работает только через
+`v2_begin_fiscal_attempt`/`v2_complete_fiscal_attempt` с отдельным worker
+context. Attempt сохраняет processing token и completion hash canonical JSON.
+Exact replay возвращает существующий attempt, изменённый replay отклоняется.
+`external_receipt_id` и provider `response_code` являются разными полями;
+issued требует receipt, failed — error code, deferred запрещает receipt.
+
 | Migration | Ответственность и таблицы | Legacy changes | Dependencies / compatibility | Pre/post checks и forward recovery |
 | --- | --- | --- | --- | --- |
 | `0007_v2_foundation.sql` | command_log, outbox, audit, migration exceptions, helpers | Нет | 0001–0006; additive | Extensions/types/grants; fix forward new migration |
