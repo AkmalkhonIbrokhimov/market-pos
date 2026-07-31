@@ -936,9 +936,15 @@ Unique pair, checks positive; sum allocations equals cost at posting.
 
 ## 37. Партии товаров
 
-### `product_batches`
+### `product_batches` (physical `public.product_batches_v2` during coexistence)
 
 **Контракт:** Inventory; lot created by posted purchase line, not document itself. PK id; FK warehouse/product/purchase line restrict; unique warehouse/batch code; RLS safe inventory read, insert only posting functions; update only controlled lifecycle metadata; delete forbidden, closed/expired statuses; outbox `BatchCreated/Depleted`; offline stock projection.
+
+Legacy `public.product_batches` остаётся V1-таблицей со ссылками на
+`stores`, `products` и `suppliers`. Migration 0013 создаёт только
+`public.product_batches_v2`; legacy table, её FK, текущий V1 UI/API и данные не
+изменяются и не получают dual-write/backfill. Controlled rename допустим только
+после backfill, reconciliation и feature cutover.
 
 | Поле | PostgreSQL type | Null | Default | Назначение |
 | --- | --- | --- | --- | --- |
@@ -1037,6 +1043,22 @@ Unique purchase and `(counterparty/template,delivery_date,sequence_number)` as a
 | comment | text | да | — | Reason details |
 
 Unique document/line. Checks nonzero delta. Header numbering indexes.
+
+### `warehouse_transfers`
+
+**Контракт:** Inventory; отдельный header межскладского перемещения. Transfer не
+является `inventory_documents.document_type`: source и destination warehouses
+проверяются в одном tenant/branch, posting создаёт равные по модулю out/in
+movements, reversal создаёт новый transfer. Draft mutable; posted/reversed
+immutable; idempotency scoped по organization/device/local operation.
+
+### `warehouse_transfer_lines`
+
+Строка ссылается только на `products_v2`, `units_v2` и optional source
+`product_batches_v2`. Поскольку batch физически warehouse-scoped, source batch
+используется только для outgoing movement; incoming movement обновляет aggregate
+destination balance без ложной cross-warehouse batch-ссылки. Оба balance scopes
+блокируются детерминированно.
 
 ## 40. Складские движения
 
@@ -2134,7 +2156,7 @@ Reconciliation jobs пишут result/cutoff, но не исправляют led
 | `0010_v2_catalog_compatibility.sql` | physical `categories_v2`, `brands_v2`, `units_v2`, `product_types_v2`, `products_v2`, barcodes/images/conversions | Legacy catalog untouched; nullable mappings, no backfill/views | 0009 | Duplicate mappings/barcodes; V1 UI/FK preserved |
 | `0011_v2_pricing.sql` | price lists/prices/requests/recommendations/history referencing `products_v2` | legacy products.sale_price retained | 0010 | One initial price; shadow compare |
 | `0012_v2_counterparties.sql` | parties/roles/contacts/addresses/credit | supplier/customer untouched | 0008 | Duplicate candidates/exceptions |
-| `0013_v2_purchases_inventory.sql` | purchase/inventory documents using `products_v2`, batches V2, ledgers/balances | Legacy documents keep FK to `public.products` | 0010–0012 | Synthetic doc rehearsal; stock reconciliation |
+| `0013_v2_purchases_inventory.sql` | purchase/inventory documents, warehouse transfers, physical `product_batches_v2`, ledgers/balances | Legacy `product_batches`/`stock_movements` and their FK remain untouched; no backfill/dual-write | 0010–0012 | Synthetic doc rehearsal; stock reconciliation |
 | `0014_v2_sales_payments.sql` | sales/lines/returns/held/payments/fiscal | V1 sales retained | 0011,0013 | Total/payment/stock tests |
 | `0015_v2_debts_settlements.sql` | receivables/allocations/settlement tables | V1 debts retained | 0012,0014 | Debt and party ledger reconciliation |
 | `0016_v2_shifts_cash.sql` | shifts/totals/cash ledger | V1 shifts retained | 0014 | Open shift conflicts/totals |
