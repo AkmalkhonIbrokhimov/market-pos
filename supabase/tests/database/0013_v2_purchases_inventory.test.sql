@@ -1,7 +1,7 @@
 begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path=public,extensions;
-select plan(517);
+select plan(547);
 
 select has_table('public',t,t||' exists') from(values ('purchase_documents'),('purchase_lines'),('purchase_additional_costs'),('purchase_cost_allocations'),('product_batches_v2'),('daily_delivery_templates'),('daily_delivery_documents'),('inventory_documents'),('inventory_document_lines'),('warehouse_transfers'),('warehouse_transfer_lines'),('inventory_movements'),('inventory_balances'),('product_batches'),('stock_movements'))x(t);
 select has_column('public',t,c,t||'.'||c) from(values ('purchase_documents','id' ),('purchase_documents','organization_id' ),('purchase_documents','branch_id' ),('purchase_documents','warehouse_id' ),('purchase_documents','counterparty_id' ),('purchase_documents','document_number' ),('purchase_documents','business_date' ),('purchase_documents','status' ),('purchase_documents','currency_code' ),('purchase_documents','subtotal_amount' ),('purchase_documents','additional_cost_amount' ),('purchase_documents','total_amount' ),('purchase_documents','device_id' ),('purchase_documents','local_operation_id' ),('purchase_documents','client_created_at' ),('purchase_documents','posted_at' ),('purchase_documents','posted_by' ),('purchase_documents','reversal_of_id' ),('purchase_documents','created_at' ),('purchase_lines','id' ),('purchase_lines','organization_id' ),('purchase_lines','purchase_document_id' ),('purchase_lines','line_number' ),('purchase_lines','product_id' ),('purchase_lines','unit_id' ),('purchase_lines','quantity' ),('purchase_lines','unit_factor' ),('purchase_lines','base_quantity' ),('purchase_lines','unit_purchase_price' ),('purchase_lines','line_amount' ),('purchase_lines','expiration_date' ),('purchase_lines','supplier_batch_number' ),('purchase_lines','created_at' ),('purchase_additional_costs','id' ),('purchase_additional_costs','organization_id' ),('purchase_additional_costs','purchase_document_id' ),('purchase_additional_costs','cost_type' ),('purchase_additional_costs','amount' ),('purchase_additional_costs','currency_code' ),('purchase_additional_costs','allocation_method' ),('purchase_additional_costs','created_at' ),('purchase_cost_allocations','id' ),('purchase_cost_allocations','organization_id' ),('purchase_cost_allocations','purchase_additional_cost_id' ),('purchase_cost_allocations','purchase_line_id' ),('purchase_cost_allocations','allocated_amount' ),('purchase_cost_allocations','created_at' ),('product_batches_v2','id' ),('product_batches_v2','organization_id' ),('product_batches_v2','warehouse_id' ),('product_batches_v2','product_id' ),('product_batches_v2','purchase_line_id' ),('product_batches_v2','batch_code' ),('product_batches_v2','supplier_batch_number' ),('product_batches_v2','received_date' ),('product_batches_v2','expiration_date' ),('product_batches_v2','initial_quantity' ),('product_batches_v2','purchase_unit_cost' ),('product_batches_v2','currency_code' ),('product_batches_v2','status' ),('product_batches_v2','created_at' ),('daily_delivery_templates','id' ),('daily_delivery_templates','organization_id' ),('daily_delivery_templates','branch_id' ),('daily_delivery_templates','counterparty_id' ),('daily_delivery_templates','name' ),('daily_delivery_templates','default_lines' ),('daily_delivery_templates','status' ),('daily_delivery_templates','created_at' ),('daily_delivery_templates','updated_at' ),('daily_delivery_templates','archived_at' ),('daily_delivery_documents','id' ),('daily_delivery_documents','organization_id' ),('daily_delivery_documents','template_id' ),('daily_delivery_documents','purchase_document_id' ),('daily_delivery_documents','delivery_date' ),('daily_delivery_documents','sequence_number' ),('daily_delivery_documents','created_at' ),('inventory_documents','id' ),('inventory_documents','organization_id' ),('inventory_documents','branch_id' ),('inventory_documents','warehouse_id' ),('inventory_documents','document_type' ),('inventory_documents','document_number' ),('inventory_documents','business_date' ),('inventory_documents','status' ),('inventory_documents','reason_code' ),('inventory_documents','device_id' ),('inventory_documents','local_operation_id' ),('inventory_documents','posted_by' ),('inventory_documents','posted_at' ),('inventory_documents','reversal_of_id' ),('inventory_documents','created_at' ),('inventory_document_lines','id' ),('inventory_document_lines','organization_id' ),('inventory_document_lines','inventory_document_id' ),('inventory_document_lines','line_number' ),('inventory_document_lines','product_id' ),('inventory_document_lines','batch_id' ),('inventory_document_lines','unit_id' ),('inventory_document_lines','quantity' ),('inventory_document_lines','unit_factor' ),('inventory_document_lines','base_quantity_delta' ),('inventory_document_lines','comment' ),('inventory_document_lines','created_at' ),('warehouse_transfers','id' ),('warehouse_transfers','organization_id' ),('warehouse_transfers','branch_id' ),('warehouse_transfers','source_warehouse_id' ),('warehouse_transfers','destination_warehouse_id' ),('warehouse_transfers','document_number' ),('warehouse_transfers','business_date' ),('warehouse_transfers','status' ),('warehouse_transfers','device_id' ),('warehouse_transfers','local_operation_id' ),('warehouse_transfers','posted_by' ),('warehouse_transfers','posted_at' ),('warehouse_transfers','reversal_of_id' ),('warehouse_transfers','created_at' ),('warehouse_transfer_lines','id' ),('warehouse_transfer_lines','organization_id' ),('warehouse_transfer_lines','warehouse_transfer_id' ),('warehouse_transfer_lines','line_number' ),('warehouse_transfer_lines','product_id' ),('warehouse_transfer_lines','batch_id' ),('warehouse_transfer_lines','unit_id' ),('warehouse_transfer_lines','quantity' ),('warehouse_transfer_lines','unit_factor' ),('warehouse_transfer_lines','base_quantity' ),('warehouse_transfer_lines','created_at' ),('inventory_movements','id' ),('inventory_movements','organization_id' ),('inventory_movements','branch_id' ),('inventory_movements','warehouse_id' ),('inventory_movements','product_id' ),('inventory_movements','batch_id' ),('inventory_movements','movement_type' ),('inventory_movements','quantity_delta' ),('inventory_movements','source_document_type' ),('inventory_movements','source_document_id' ),('inventory_movements','source_line_id' ),('inventory_movements','movement_role' ),('inventory_movements','reversal_of_id' ),('inventory_movements','command_id' ),('inventory_movements','created_by' ),('inventory_movements','created_at' ),('inventory_balances','id' ),('inventory_balances','organization_id' ),('inventory_balances','warehouse_id' ),('inventory_balances','product_id' ),('inventory_balances','batch_id' ),('inventory_balances','on_hand_quantity' ),('inventory_balances','reserved_quantity' ),('inventory_balances','available_quantity' ),('inventory_balances','last_movement_id' ),('inventory_balances','version' ),('inventory_balances','updated_at' ))x(t,c);
@@ -171,6 +171,94 @@ reset role;
 select is((select sequence_number from daily_delivery_documents d join purchase_documents p on p.id=d.purchase_document_id where p.document_number='D13-2'),2,'daily sequence increments under template lock');
 select throws_ok($$select set_config('market_pos.inventory_command','on',true);update warehouse_transfers set status='reversed',document_number='mutated'where document_number='T13-1'$$,'P0001','V2_TRANSFER_POSTED_IMMUTABLE','posted transfer reversal is status-only');
 select ok(position('order by value->>''warehouse_id'',value->>''product_id'''in pg_get_functiondef('public.v2_lock_inventory_scopes(uuid,jsonb)'::regprocedure))>0,'lock helper orders warehouse then product then batch');
+
+-- Final hardening: cost-sensitive headers, complete identity, and reversal replay.
+insert into auth.users(instance_id,id,aud,role,email,encrypted_password,email_confirmed_at,created_at,updated_at)values
+('00000000-0000-0000-0000-000000000000','00000000-0000-0000-0000-000000013011','authenticated','authenticated','view13@test','',now(),now(),now()),
+('00000000-0000-0000-0000-000000000000','00000000-0000-0000-0000-000000013012','authenticated','authenticated','cost13@test','',now(),now(),now()),
+('00000000-0000-0000-0000-000000000000','00000000-0000-0000-0000-000000013013','authenticated','authenticated','both13@test','',now(),now(),now());
+insert into user_profiles(id,auth_user_id,full_name)values
+('00000000-0000-0000-0000-000000013211','00000000-0000-0000-0000-000000013011','View13'),
+('00000000-0000-0000-0000-000000013212','00000000-0000-0000-0000-000000013012','Cost13'),
+('00000000-0000-0000-0000-000000013213','00000000-0000-0000-0000-000000013013','Both13');
+insert into organization_memberships(id,organization_id,user_profile_id,system_role,status,joined_at)values
+('00000000-0000-0000-0000-000000013311','00000000-0000-0000-0000-000000013101','00000000-0000-0000-0000-000000013211','seller','active',now()),
+('00000000-0000-0000-0000-000000013312','00000000-0000-0000-0000-000000013101','00000000-0000-0000-0000-000000013212','seller','active',now()),
+('00000000-0000-0000-0000-000000013313','00000000-0000-0000-0000-000000013101','00000000-0000-0000-0000-000000013213','seller','active',now());
+insert into branch_access(organization_id,membership_id,branch_id)values
+('00000000-0000-0000-0000-000000013101','00000000-0000-0000-0000-000000013311','00000000-0000-0000-0000-000000013401'),
+('00000000-0000-0000-0000-000000013101','00000000-0000-0000-0000-000000013312','00000000-0000-0000-0000-000000013401'),
+('00000000-0000-0000-0000-000000013101','00000000-0000-0000-0000-000000013313','00000000-0000-0000-0000-000000013401');
+insert into permission_profiles(id,organization_id,code,name)values
+('00000000-0000-0000-0000-000000013111','00000000-0000-0000-0000-000000013101','view13','View13'),
+('00000000-0000-0000-0000-000000013112','00000000-0000-0000-0000-000000013101','cost13','Cost13'),
+('00000000-0000-0000-0000-000000013113','00000000-0000-0000-0000-000000013101','both13','Both13');
+insert into permission_profile_permissions(permission_profile_id,permission_id)
+select '00000000-0000-0000-0000-000000013111'::uuid,id from permissions where code='purchases.view'
+union all select '00000000-0000-0000-0000-000000013112'::uuid,id from permissions where code='purchases.cost.view'
+union all select '00000000-0000-0000-0000-000000013113'::uuid,id from permissions where code in('purchases.view','purchases.cost.view');
+insert into membership_permission_profiles(membership_id,permission_profile_id,assigned_by)values
+('00000000-0000-0000-0000-000000013311','00000000-0000-0000-0000-000000013111','00000000-0000-0000-0000-000000013301'),
+('00000000-0000-0000-0000-000000013312','00000000-0000-0000-0000-000000013112','00000000-0000-0000-0000-000000013301'),
+('00000000-0000-0000-0000-000000013313','00000000-0000-0000-0000-000000013113','00000000-0000-0000-0000-000000013301');
+
+select set_config('request.jwt.claim.sub','00000000-0000-0000-0000-000000013011',true);set local role authenticated;
+select ok((select count(*)from v2_purchase_journal('00000000-0000-0000-0000-000000013101',null))>0,'view-only membership sees redacted journal');
+select is((select count(*)from purchase_documents),0::bigint,'view-only membership sees no raw purchase headers');
+select ok(not((select to_jsonb(j)from v2_purchase_journal('00000000-0000-0000-0000-000000013101',null)j limit 1)?|array['subtotal_amount','additional_cost_amount','total_amount','unit_purchase_price','line_amount','allocated_amount','purchase_unit_cost']),'journal omits every cost field');
+select ok((select count(*)from daily_delivery_documents)>0,'daily metadata remains visible to view-only membership');
+select ok(v2_can_view_purchase_metadata((select id from purchase_documents where false))is false,'metadata helper reveals no missing document');
+reset role;
+select set_config('request.jwt.claim.sub','00000000-0000-0000-0000-000000013012',true);set local role authenticated;
+select is((select count(*)from purchase_documents),0::bigint,'cost-only membership sees no raw headers');
+select is((select count(*)from v2_purchase_journal('00000000-0000-0000-0000-000000013101',null)),0::bigint,'cost-only membership sees no journal');
+reset role;
+select set_config('request.jwt.claim.sub','00000000-0000-0000-0000-000000013013',true);set local role authenticated;
+select ok((select count(*)from purchase_documents)>0,'both permissions reveal raw headers');
+select ok((select count(*)from purchase_cost_allocations)>0,'both permissions reveal raw allocations');
+reset role;
+
+select set_config('request.jwt.claim.sub','00000000-0000-0000-0000-000000013001',true);set local role authenticated;
+select is(v2_create_purchase_draft('00000000-0000-0000-0000-000000013101','00000000-0000-0000-0000-000000013401','00000000-0000-0000-0000-000000013501','00000000-0000-0000-0000-000000013801','P13-2',current_date,'UZS',null,'00000000-0000-0000-0000-000000013910'),(select id from purchase_documents where document_number='P13-2'),'complete draft payload same replay returns same id');
+select throws_ok($$select v2_create_purchase_draft('00000000-0000-0000-0000-000000013101','00000000-0000-0000-0000-000000013401','00000000-0000-0000-0000-000000013501','00000000-0000-0000-0000-000000013801','P13-2',current_date,'USD',null,'00000000-0000-0000-0000-000000013910')$$,'P0001','V2_IDEMPOTENCY_PAYLOAD_MISMATCH','same operation different currency denied');
+select throws_ok($$select v2_create_purchase_draft('00000000-0000-0000-0000-000000013101','00000000-0000-0000-0000-000000013499','00000000-0000-0000-0000-000000013501','00000000-0000-0000-0000-000000013801','P13-2',current_date,'UZS',null,'00000000-0000-0000-0000-000000013910')$$,'P0001','V2_IDEMPOTENCY_PAYLOAD_MISMATCH','same operation different branch denied');
+reset role;
+select throws_ok($$select v2_begin_inventory_command('00000000-0000-0000-0000-000000013101','00000000-0000-0000-0000-000000013401',null,'00000000-0000-0000-0000-000000013910','purchase.post',jsonb_build_object('organization_id','00000000-0000-0000-0000-000000013101'::uuid,'branch_id','00000000-0000-0000-0000-000000013401'::uuid,'warehouse_id','00000000-0000-0000-0000-000000013501'::uuid,'counterparty_id','00000000-0000-0000-0000-000000013801'::uuid,'document_number','P13-2','business_date',current_date,'currency_code','UZS'::char(3),'device_id',null))$$,'P0001','V2_IDEMPOTENCY_COMMAND_TYPE_MISMATCH','same operation different command type denied');
+select is((select count(*)from purchase_documents where document_number='P13-2'),1::bigint,'idempotency attacks create no extra purchase');
+select is((select count(*)from outbox_events where event_type='PurchaseDraftCreated'and aggregate_id=(select id from purchase_documents where document_number='P13-2')),1::bigint,'idempotency attacks create no extra draft event');
+
+select set_config('request.jwt.claim.sub','00000000-0000-0000-0000-000000013001',true);set local role authenticated;
+select lives_ok($$select v2_reverse_warehouse_transfer((select id from warehouse_transfers where document_number='T13-1'),'T13-1-R','00000000-0000-0000-0000-000000013930','{}')$$,'transfer reversal succeeds');
+reset role;
+select is((select status from warehouse_transfers where document_number='T13-1'),'reversed','transfer original becomes reversed');
+select is((select count(*)from warehouse_transfers where reversal_of_id=(select id from warehouse_transfers where document_number='T13-1')),1::bigint,'one transfer reversal graph created');
+select is((select count(*)from inventory_movements where movement_type='transfer_reversal'),2::bigint,'transfer reversal creates two opposite movements');
+set local role authenticated;
+select is(v2_reverse_warehouse_transfer((select id from warehouse_transfers where document_number='T13-1'),'T13-1-R','00000000-0000-0000-0000-000000013930','{}'),(select id from warehouse_transfers where reversal_of_id=(select id from warehouse_transfers where document_number='T13-1')),'transfer reversal replay returns same id');
+reset role;
+select is((select count(*)from inventory_movements where movement_type='transfer_reversal'),2::bigint,'transfer replay creates no movements');
+select is((select count(*)from outbox_events where event_type='WarehouseTransferReversed'),1::bigint,'transfer replay creates no events');
+set local role authenticated;
+select throws_ok($$select v2_reverse_warehouse_transfer((select id from warehouse_transfers where document_number='T13-1'),'T13-1-R2','00000000-0000-0000-0000-000000013931','{}')$$,'P0001','V2_TRANSFER_ALREADY_REVERSED','new operation double transfer reversal denied');
+reset role;
+
+select set_config('market_pos.counterparty_command','on',true);update counterparty_roles set ended_at=now()where counterparty_id='00000000-0000-0000-0000-000000013801'and role_code='supplier';select set_config('market_pos.counterparty_command','off',true);
+select ok(exists(select 1 from counterparty_roles where counterparty_id='00000000-0000-0000-0000-000000013801'and ended_at is not null),'supplier role ended after posting');
+insert into command_log(id,organization_id,branch_id,actor_auth_user_id,actor_membership_id,local_operation_id,command_type,payload_hash)values('00000000-0000-0000-0000-000000013940','00000000-0000-0000-0000-000000013101','00000000-0000-0000-0000-000000013401','00000000-0000-0000-0000-000000013001','00000000-0000-0000-0000-000000013301','00000000-0000-0000-0000-000000013941','purchases.reverse',encode(digest((jsonb_build_object('purchase_id',(select id from purchase_documents where document_number='P13-2'),'document_number','P13-2-R'))::text,'sha256'),'hex'));
+insert into approval_requests(id,organization_id,branch_id,command_id,permission_code,requested_by,status,reason,payload_hash,approved_by,decided_at,expires_at)select '00000000-0000-0000-0000-000000013942',organization_id,branch_id,id,'purchases.reverse','00000000-0000-0000-0000-000000013311','approved','reverse',payload_hash,'00000000-0000-0000-0000-000000013301',clock_timestamp(),clock_timestamp()+interval'3 seconds'from command_log where id='00000000-0000-0000-0000-000000013940';
+select set_config('request.jwt.claim.sub','00000000-0000-0000-0000-000000013001',true);set local role authenticated;
+select lives_ok($$select v2_reverse_purchase((select id from purchase_documents where document_number='P13-2'),'P13-2-R','00000000-0000-0000-0000-000000013941','00000000-0000-0000-0000-000000013942','{}')$$,'historical purchase reverses after supplier role ended');
+reset role;
+select is((select status from purchase_documents where document_number='P13-2'),'reversed','purchase original becomes reversed');
+select is((select count(*)from purchase_additional_costs where purchase_document_id=(select id from purchase_documents where document_number='P13-2-R')),2::bigint,'purchase reversal copies costs');
+select is((select count(*)from purchase_cost_allocations a join purchase_additional_costs c on c.id=a.purchase_additional_cost_id where c.purchase_document_id=(select id from purchase_documents where document_number='P13-2-R')),4::bigint,'purchase reversal copies allocations');
+set local role authenticated;
+select is(v2_reverse_purchase((select id from purchase_documents where document_number='P13-2'),'P13-2-R','00000000-0000-0000-0000-000000013941','00000000-0000-0000-0000-000000013942','{}'),(select id from purchase_documents where document_number='P13-2-R'),'purchase reversal replay returns same id');
+reset role;
+select pg_sleep(3.2);
+set local role authenticated;
+select is(v2_reverse_purchase((select id from purchase_documents where document_number='P13-2'),'P13-2-R','00000000-0000-0000-0000-000000013941','00000000-0000-0000-0000-000000013942','{}'),(select id from purchase_documents where document_number='P13-2-R'),'successful approved reversal replays after expiry');
+reset role;
 
 select * from finish();
 rollback;
