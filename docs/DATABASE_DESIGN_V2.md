@@ -2226,6 +2226,14 @@ payments, ссылающиеся на исходные refund rows; original ret
 active customer role. Return headers/lines, allocations и payments защищены
 строгими lifecycle/append-only guards.
 
+Отмена возврата восстанавливает capacity исходной sale line и конкретной
+product batch: новый active ordinary return может повторно вернуть ту же
+quantity из той же партии. Аналогично, reversal refund восстанавливает payment
+refund capacity. Active refund — confirmed отрицательная payment, ссылающаяся
+на исходную положительную payment, для которой не существует confirmed
+opposite reversal payment. Поэтому отменённые refunds не входят в cumulative
+refunded amount, но method, currency и reversal links остаются строгими.
+
 Shift RLS использует `v2_can_view_shift`: seller видит только свои shifts и
 totals, owner — авторизованный branch, support — только exact active
 `sales.view` grant. Raw `fiscal_documents` и diagnostic attempts доступны
@@ -2238,6 +2246,9 @@ Fiscal worker не имеет прямых table writes и работает то
 `v2_begin_fiscal_attempt`/`v2_complete_fiscal_attempt` с отдельным worker
 context. Attempt сохраняет processing token и completion hash canonical JSON.
 Exact replay возвращает существующий attempt, изменённый replay отклоняется.
+Для существующего attempt replay детерминированно сначала проверяет processing
+token, затем completion hash: неверный token даёт token mismatch, а совпавший
+token с другим результатом — completion payload mismatch.
 `external_receipt_id` и provider `response_code` являются разными полями;
 issued требует receipt, failed — error code, deferred запрещает receipt.
 
