@@ -30,9 +30,9 @@ select is(i.column_default is not null,e.has_default,e.table_name||'.'||e.column
 
 -- Coexistence, permissions, templates and inventory source extension.
 select has_table('public',t,'legacy '||t||' remains')from(values('sales'),('sale_items'),('payments'),('shifts'))x(t);
-select is((select count(*)from permissions),51::bigint,'permission registry 51');
-select is((select count(*)from permissions where critical),9::bigint,'critical registry nine');
-select is((select count(*)from permission_profile_permissions where permission_profile_id='00000000-0000-0000-0000-000000000101'),51::bigint,'owner template 51');
+select is((select count(*)from permissions),53::bigint,'permission registry 53');
+select is((select count(*)from permissions where critical),10::bigint,'critical registry ten');
+select is((select count(*)from permission_profile_permissions where permission_profile_id='00000000-0000-0000-0000-000000000101'),53::bigint,'owner template 53');
 select is((select count(*)from permission_profile_permissions where permission_profile_id='00000000-0000-0000-0000-000000000102'),16::bigint,'seller template 16');
 select ok(exists(select 1 from permissions where code='sales.cost.view'and module='sales'and not critical),'sales.cost.view registered');
 select ok(exists(select 1 from permission_profile_permissions ppp join permissions p on p.id=ppp.permission_id where ppp.permission_profile_id='00000000-0000-0000-0000-000000000101'and p.code='sales.cost.view'),'owner receives cost permission');
@@ -102,6 +102,7 @@ select throws_ok($$insert into held_sales(organization_id,branch_id,register_id,
 insert into auth.users(instance_id,id,aud,role,email,encrypted_password,email_confirmed_at,created_at,updated_at)values
  ('00000000-0000-0000-0000-000000000000','00000000-0000-0000-0000-000000014001','authenticated','authenticated','owner14@test','','now','now','now');
 insert into organizations(id,name)values('00000000-0000-0000-0000-000000014101','Org14');
+insert into organization_settings(organization_id,currency_code,timezone)values('00000000-0000-0000-0000-000000014101','UZS','Asia/Tashkent');
 insert into user_profiles(id,auth_user_id,full_name)values('00000000-0000-0000-0000-000000014201','00000000-0000-0000-0000-000000014001','Owner14');
 insert into organization_memberships(id,organization_id,user_profile_id,system_role,status,joined_at)values('00000000-0000-0000-0000-000000014301','00000000-0000-0000-0000-000000014101','00000000-0000-0000-0000-000000014201','owner','active',now());
 insert into membership_permission_profiles(membership_id,permission_profile_id,assigned_by)values('00000000-0000-0000-0000-000000014301','00000000-0000-0000-0000-000000000101','00000000-0000-0000-0000-000000014301');
@@ -165,8 +166,8 @@ select is((select on_hand_quantity from inventory_balances where batch_id='00000
 select ok(exists(select 1 from payments_v2 p join payments_v2 original on original.id=p.reversal_of_id where p.sale_return_id=(select id from sale_returns where document_number='SR14-1')and p.amount=-10 and original.amount=15),'refund references matching original payment');
 select is((select expected_amount from shift_totals where shift_id=(select id from shifts_v2 where register_id='00000000-0000-0000-0000-000000014601')and payment_method='cash'),5.0000::numeric,'signed refund updates cash projection');
 set local role authenticated;
-select lives_ok($$select v2_close_shift((select id from shifts_v2 where register_id='00000000-0000-0000-0000-000000014601'),'00000000-0000-0000-0000-000000014701',105,'00000000-0000-0000-0000-000000014803')$$,'shift closes with reconciled cash');
-select is(v2_close_shift((select id from shifts_v2 where register_id='00000000-0000-0000-0000-000000014601'),'00000000-0000-0000-0000-000000014701',105,'00000000-0000-0000-0000-000000014803'),(select id from shifts_v2 where register_id='00000000-0000-0000-0000-000000014601'),'close replay returns same shift');
+select lives_ok($$select v2_close_shift((select id from shifts_v2 where register_id='00000000-0000-0000-0000-000000014601'),'00000000-0000-0000-0000-000000014701','{"cash":105,"card":5,"transfer":0}'::jsonb,'[{"line_number":1,"denomination_value":105,"quantity":1}]'::jsonb,'00000000-0000-0000-0000-000000014803',null)$$,'shift closes with canonical reconciled totals');
+select is(v2_close_shift((select id from shifts_v2 where register_id='00000000-0000-0000-0000-000000014601'),'00000000-0000-0000-0000-000000014701','{"cash":105,"card":5,"transfer":0}'::jsonb,'[{"line_number":1,"denomination_value":105,"quantity":1}]'::jsonb,'00000000-0000-0000-0000-000000014803',null),(select id from shifts_v2 where register_id='00000000-0000-0000-0000-000000014601'),'canonical close replay returns same shift');
 reset role;
 select is((select status from shifts_v2 where register_id='00000000-0000-0000-0000-000000014601'),'closed','shift becomes closed');
 select is((select difference_amount from shifts_v2 where register_id='00000000-0000-0000-0000-000000014601'),0.0000::numeric,'cash difference reconciles to zero');

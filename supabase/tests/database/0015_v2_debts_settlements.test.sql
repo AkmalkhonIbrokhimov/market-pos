@@ -12,11 +12,11 @@ select ok(not has_table_privilege('authenticated',format('public.%I',t),'INSERT,
 select ok(has_table_privilege('authenticated',format('public.%I',t),'SELECT'),'authenticated SELECT via RLS '||t)from(values('receivables'),('debt_payments_v2'),('debt_allocations'),('settlement_entries'),('settlement_periods'),('settlement_acts'),('settlement_act_lines'))x(t);
 
 -- Permission registry is exact after 0015.
-select is((select count(*)from permissions),51::bigint,'permission registry 51');
-select is((select count(*)from permissions where critical),9::bigint,'critical permissions 9');
-select is((select count(*)from permission_profile_permissions where permission_profile_id='00000000-0000-0000-0000-000000000101'),51::bigint,'owner profile 51');
+select is((select count(*)from permissions),53::bigint,'permission registry 53');
+select is((select count(*)from permissions where critical),10::bigint,'critical permissions 10');
+select is((select count(*)from permission_profile_permissions where permission_profile_id='00000000-0000-0000-0000-000000000101'),53::bigint,'owner profile 53');
 select is((select count(*)from permission_profile_permissions where permission_profile_id='00000000-0000-0000-0000-000000000102'),16::bigint,'seller profile remains 16');
-select set_eq($$select code from permissions where critical$$,$$select * from(values('purchases.reverse'),('sales.reverse'),('sales.discount.override'),('debts.limit.override'),('cash.move.override'),('support.access.approve'),('debts.reverse'),('debts.write_off'),('settlements.close'))x(code)$$,'critical permission set exact');
+select set_eq($$select code from permissions where critical$$,$$select * from(values('purchases.reverse'),('sales.reverse'),('sales.discount.override'),('debts.limit.override'),('cash.move.override'),('support.access.approve'),('debts.reverse'),('debts.write_off'),('settlements.close'),('settlements.reverse'))x(code)$$,'critical permission set exact');
 select ok(exists(select 1 from permissions where code=p and module=m and critical),p||' registered critical')from(values('debts.reverse','debts'),('debts.write_off','debts'),('settlements.close','settlements'))x(p,m);
 select ok(exists(select 1 from permission_profile_permissions x join permissions p on p.id=x.permission_id where x.permission_profile_id='00000000-0000-0000-0000-000000000101'and p.code=c),'owner receives '||c)from(values('debts.reverse'),('debts.write_off'),('settlements.close'))x(c);
 select ok(not exists(select 1 from permission_profile_permissions x join permissions p on p.id=x.permission_id where x.permission_profile_id='00000000-0000-0000-0000-000000000102'and p.code=c),'seller denied '||c)from(values('debts.reverse'),('debts.write_off'),('settlements.close'))x(c);
@@ -106,6 +106,9 @@ insert into auth.users(instance_id,id,aud,role,email,encrypted_password,email_co
 insert into auth.users(instance_id,id,aud,role,email,encrypted_password,email_confirmed_at,created_at,updated_at)values('00000000-0000-0000-0000-000000000000','00000000-0000-0000-0000-000000015003','authenticated','authenticated','seller15@test','',now(),now(),now());
 insert into organizations(id,name)values('00000000-0000-0000-0000-000000015101','Org15');
 insert into organizations(id,name)values('00000000-0000-0000-0000-000000015102','OtherOrg15');
+insert into organization_settings(organization_id,currency_code,timezone)values
+ ('00000000-0000-0000-0000-000000015101','UZS','Asia/Tashkent'),
+ ('00000000-0000-0000-0000-000000015102','UZS','Asia/Tashkent');
 insert into user_profiles(id,auth_user_id,full_name)values('00000000-0000-0000-0000-000000015201','00000000-0000-0000-0000-000000015001','Owner15');
 insert into user_profiles(id,auth_user_id,full_name)values('00000000-0000-0000-0000-000000015202','00000000-0000-0000-0000-000000015002','Approver15');
 insert into user_profiles(id,auth_user_id,full_name)values('00000000-0000-0000-0000-000000015203','00000000-0000-0000-0000-000000015003','Seller15');
