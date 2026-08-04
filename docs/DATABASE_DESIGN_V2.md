@@ -2280,9 +2280,11 @@ Registry после migration содержит 53 permissions, 10 critical, owne
 `settlements.reverse`; обе входят только в owner system template.
 
 `v2_lock_register_shift_scope(organization,branch,register)` использует
-transaction-scoped advisory lock. Command/idempotency и approval получают до
-него, затем блокируются register/shift, trusted device, source graph, cash rows
-и ordered method totals; settlement lock следует для supplier/debt scopes.
+transaction-scoped advisory lock. Единый порядок: command/idempotency, approval,
+register advisory lock, shift row, device/source, settlement advisory lock,
+financial ledgers, totals, audit/outbox. Ни один cash-aware wrapper не получает
+settlement lock раньше register lock; повторный lock внутри base function
+reentrant в той же transaction.
 Единый helper вызывают open/close, sale/return/reversal, debt
 payment/reversal, manual cash и supplier payment/reversal writers. Это
 сериализует payment writer с close и не оставляет externally committed
@@ -2299,17 +2301,44 @@ Cash ledger является signed physical source of truth. Exact helper
 для cash: positive sale, negative refund, positive return reversal, negative
 sale reversal, positive debt collection, negative debt reversal, negative
 supplier payment и positive supplier reversal. Источник — exact payment ID;
-reversal продолжает единственную physical chain и replay не дублирует row.
+unique semantic index гарантирует одну movement для каждого exact payment row.
+Ordinary partial refund является независимой negative `refund` movement без
+`reversal_of_id`; несколько partial refunds разрешены payment capacity guard.
+Только reversal конкретного refund создаёт positive `refund` с exact ссылкой на
+его movement. Sale/debt/supplier reversals также ссылаются непосредственно на
+exact source movement; alternating reversal chain отсутствует.
 Manual `cash_in`, `cash_out` и signed `correction` требуют непустой reason;
 correction и любое manual reversal используют exact `cash.move.override`
-approval. Reasons, contacts, approval reason, fingerprints, tokens и hashes не
+approval. Primary signs не применяются к reversal: cash-in reversal отрицателен,
+cash-out reversal положителен, correction reversal всегда exact opposite.
+`v2_require_cash_drawer_capacity` последовательно проверяет каждую отрицательную
+проводку; ожидаемый physical cash не может стать отрицательным, иначе
+`V2_CASH_INSUFFICIENT_DRAWER`. Reasons, contacts, approval reason, fingerprints, tokens и hashes не
 попадают в semantic event payload.
+
+Opening movement имеет exact graph: source/shift, opening amount, open command,
+operation, device и actor совпадают с созданной shift; opening нельзя reverse.
+Manual correction/reversal guard требует approved, unexpired
+`cash.move.override` exact command/branch. Supplier reversal требует approved,
+unexpired `settlements.reverse`; status original меняется только после создания
+exact reversal header и settlement reversal с тем же command/approval.
+
+Supplier payment требует не только отрицательный balance, но и фактическую
+active либо ended supplier role history. Archived supplier допустим только с
+ended supplier role; party, никогда не имевшая supplier role, получает
+`V2_SUPPLIER_ROLE_HISTORY_REQUIRED`. Canonical
+`v2_supplier_payment_journal(organization,branch,counterparty,currency)`
+авторизует и возвращает ровно одну currency. Старый three-argument wrapper
+работает только при одной distinct payment currency, иначе требует явную
+currency через `V2_SUPPLIER_PAYMENT_CURRENCY_REQUIRED`.
 
 Canonical close требует exact JSON keys `cash/card/transfer`, nonempty
 denomination array без unknown keys и sum counts = physical cash actual. Он
 блокирует shift и source ledgers, пересчитывает signed confirmed payments,
 проверяет one cash movement per cash payment и отсутствие orphan movements.
-`expected physical cash = sum(cash_movements.amount_delta)`. Payment-equivalent
+`expected physical cash = sum(cash_movements.amount_delta)` и не может быть
+отрицательным; close выдаёт тот же `V2_CASH_INSUFFICIENT_DRAWER` до snapshot.
+Payment-equivalent
 cash actual равен `physical count − opening − manual cash-in/out − corrections`.
 Tolerance в 0016 равна zero: любое отличие cash/card/transfer требует exact
 `cash.move.override` approval и только тогда выпускает

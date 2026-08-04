@@ -118,7 +118,7 @@ create table public.cash_movements(
  )
 );
 create unique index cash_movements_one_opening on public.cash_movements(shift_id) where movement_type='opening'and reversal_of_id is null;
-create unique index cash_movements_primary_payment on public.cash_movements(source_id) where source_type='payment'and reversal_of_id is null;
+create unique index cash_movements_payment_source_key on public.cash_movements(source_id) where source_type='payment';
 create unique index cash_movements_one_reversal on public.cash_movements(reversal_of_id) where reversal_of_id is not null;
 create unique index cash_movements_manual_operation on public.cash_movements(organization_id,device_id,local_operation_id)
  where source_type='command'and reversal_of_id is null;
@@ -169,33 +169,34 @@ create or replace function public.v2_supplier_payment_context_required()returns 
 begin if coalesce(current_setting('market_pos.supplier_payment_command',true),'')<>'on'then raise exception using errcode='P0001',message='V2_SUPPLIER_PAYMENT_COMMAND_CONTEXT_REQUIRED';end if;return coalesce(new,old);end$$;
 
 create or replace function public.v2_guard_cash_movement()returns trigger language plpgsql set search_path=''as $$
-declare s public.shifts_v2%rowtype;p public.payments_v2%rowtype;o public.cash_movements%rowtype;c public.command_log%rowtype;a public.approval_requests%rowtype;chain_ok boolean;begin
+declare s public.shifts_v2%rowtype;p public.payments_v2%rowtype;o public.cash_movements%rowtype;c public.command_log%rowtype;a public.approval_requests%rowtype;expected_reversal uuid;expected_type text;begin
  select * into s from public.shifts_v2 where id=new.shift_id;
  select * into c from public.command_log where id=new.command_id;
  if s.id is null or s.status<>'open'or s.organization_id<>new.organization_id or s.branch_id<>new.branch_id or s.register_id<>new.register_id or s.currency_code<>new.currency_code or s.business_date<>new.business_date then raise exception using errcode='P0001',message='V2_CASH_SHIFT_SCOPE_MISMATCH';end if;
  if c.id is null or c.organization_id<>new.organization_id or c.branch_id is distinct from new.branch_id or c.device_id is distinct from new.device_id or c.status not in('processing','succeeded')then raise exception using errcode='P0001',message='V2_CASH_COMMAND_SCOPE_MISMATCH';end if;
  if not exists(select 1 from public.devices_v2 d where d.id=new.device_id and d.organization_id=new.organization_id and d.branch_id=new.branch_id and d.register_id=new.register_id and d.status='trusted')then raise exception using errcode='P0001',message='V2_CASH_DEVICE_SCOPE_MISMATCH';end if;
  if not exists(select 1 from public.organization_memberships m where m.id=new.created_by and m.organization_id=new.organization_id and m.status='active')then raise exception using errcode='P0001',message='V2_CASH_ACTOR_SCOPE_MISMATCH';end if;
- if new.approval_request_id is not null then select * into a from public.approval_requests where id=new.approval_request_id;if a.id is null or a.organization_id<>new.organization_id or a.command_id<>new.command_id or a.status<>'approved'then raise exception using errcode='P0001',message='V2_CASH_APPROVAL_SCOPE_MISMATCH';end if;end if;
+ if new.approval_request_id is not null then select * into a from public.approval_requests where id=new.approval_request_id;if a.id is null or a.organization_id<>new.organization_id or a.branch_id is distinct from new.branch_id or a.command_id<>new.command_id or a.status<>'approved'or a.expires_at<=clock_timestamp()then raise exception using errcode='P0001',message='V2_CASH_APPROVAL_SCOPE_MISMATCH';end if;end if;
  if new.reversal_of_id is not null then
   select * into o from public.cash_movements where id=new.reversal_of_id;
-  if o.id is null or o.movement_type='opening'or o.organization_id<>new.organization_id or o.branch_id<>new.branch_id or o.register_id<>new.register_id or o.currency_code<>new.currency_code then raise exception using errcode='P0001',message='V2_CASH_REVERSAL_MISMATCH';end if;
-  if new.source_type='payment'and new.movement_type='refund'and o.movement_type='sale'then
-   if new.amount_delta>=0 or o.amount_delta<=0 or abs(new.amount_delta)>o.amount_delta then raise exception using errcode='P0001',message='V2_CASH_REVERSAL_MISMATCH';end if;
-  elsif new.amount_delta<>-o.amount_delta or new.movement_type<>o.movement_type then raise exception using errcode='P0001',message='V2_CASH_REVERSAL_MISMATCH';end if;
+  if o.id is null or o.movement_type='opening'or o.organization_id<>new.organization_id or o.branch_id<>new.branch_id or o.register_id<>new.register_id or o.currency_code<>new.currency_code or new.amount_delta<>-o.amount_delta or new.movement_type<>o.movement_type then raise exception using errcode='P0001',message='V2_CASH_REVERSAL_MISMATCH';end if;
  end if;
  case new.source_type
-  when'shift'then if new.movement_type<>'opening'or new.source_id<>new.shift_id or new.reversal_of_id is not null then raise exception using errcode='P0001',message='V2_CASH_SOURCE_GRAPH_MISMATCH';end if;
+  when'shift'then
+   if new.movement_type<>'opening'or new.source_id<>new.shift_id or new.reversal_of_id is not null or new.amount_delta<>s.opening_cash_amount or new.command_id<>s.open_command_id or c.command_type<>'shift.open'or c.organization_id<>s.organization_id or c.branch_id is distinct from s.branch_id or c.device_id is distinct from new.device_id or c.local_operation_id<>new.local_operation_id or new.created_by<>s.opened_by then raise exception using errcode='P0001',message='V2_CASH_OPENING_SOURCE_MISMATCH';end if;
   when'payment'then
    select * into p from public.payments_v2 where id=new.source_id;
-   if p.reversal_of_id is not null and o.id is not null then
-    with recursive ancestry as(select x.id,x.reversal_of_id,x.source_id from public.cash_movements x where x.id=o.id union all select x.id,x.reversal_of_id,x.source_id from public.cash_movements x join ancestry q on q.reversal_of_id=x.id)
-    select exists(select 1 from ancestry where source_id=p.reversal_of_id)into chain_ok;
+   if p.sale_id is not null then expected_type:='sale';if p.reversal_of_id is not null then select id into expected_reversal from public.cash_movements where source_type='payment'and source_id=p.reversal_of_id;end if;
+   elsif p.sale_return_id is not null then expected_type:='refund';if p.amount>0 and p.reversal_of_id is not null then select id into expected_reversal from public.cash_movements where source_type='payment'and source_id=p.reversal_of_id;end if;
+   elsif p.debt_payment_id is not null then expected_type:='debt_payment';if p.reversal_of_id is not null then select id into expected_reversal from public.cash_movements where source_type='payment'and source_id=p.reversal_of_id;end if;
+   elsif p.supplier_payment_id is not null then expected_type:='supplier_payment';if p.reversal_of_id is not null then select id into expected_reversal from public.cash_movements where source_type='payment'and source_id=p.reversal_of_id;end if;
    end if;
-   if p.id is null or p.method<>'cash'or p.organization_id<>new.organization_id or p.branch_id<>new.branch_id or p.register_id<>new.register_id or p.shift_id<>new.shift_id or p.device_id<>new.device_id or p.currency_code<>new.currency_code or p.amount<>new.amount_delta or(p.reversal_of_id is null and new.reversal_of_id is not null)or(p.reversal_of_id is not null and(new.reversal_of_id is null or not coalesce(chain_ok,false)))then raise exception using errcode='P0001',message='V2_CASH_PAYMENT_SOURCE_MISMATCH';end if;
-  when'command'then if new.movement_type not in('cash_in','cash_out','correction')or new.source_id<>new.command_id then raise exception using errcode='P0001',message='V2_CASH_SOURCE_GRAPH_MISMATCH';end if;
- end case;
- if(new.movement_type='cash_in'and new.amount_delta<=0)or(new.movement_type='cash_out'and new.amount_delta>=0)then raise exception using errcode='P0001',message='V2_CASH_MOVEMENT_SIGN_MISMATCH';end if;
+   if p.id is null or p.method<>'cash'or expected_type is null or new.movement_type<>expected_type or p.organization_id<>new.organization_id or p.branch_id<>new.branch_id or p.register_id<>new.register_id or p.shift_id<>new.shift_id or p.device_id<>new.device_id or p.currency_code<>new.currency_code or p.amount<>new.amount_delta or new.reversal_of_id is distinct from expected_reversal then raise exception using errcode='P0001',message='V2_CASH_PAYMENT_SOURCE_MISMATCH';end if;
+  when'command'then
+   if new.movement_type not in('cash_in','cash_out','correction')or new.source_id<>new.command_id then raise exception using errcode='P0001',message='V2_CASH_SOURCE_GRAPH_MISMATCH';end if;
+   if(new.movement_type='correction'or new.reversal_of_id is not null)and(a.id is null or a.permission_code<>'cash.move.override')then raise exception using errcode='P0001',message='V2_CASH_APPROVAL_SCOPE_MISMATCH';end if;
+  end case;
+ if new.reversal_of_id is null and((new.movement_type='cash_in'and new.amount_delta<=0)or(new.movement_type='cash_out'and new.amount_delta>=0)or(new.movement_type='correction'and new.amount_delta=0))then raise exception using errcode='P0001',message='V2_CASH_MOVEMENT_SIGN_MISMATCH';end if;
  return new;
 end$$;
 
@@ -205,18 +206,21 @@ declare s public.shifts_v2%rowtype;begin select * into s from public.shifts_v2 w
  if not exists(select 1 from public.organization_memberships m where m.id=new.counted_by and m.organization_id=new.organization_id and m.status='active')then raise exception using errcode='P0001',message='V2_SHIFT_CASH_COUNT_ACTOR_MISMATCH';end if;return new;end$$;
 
 create or replace function public.v2_guard_supplier_payment()returns trigger language plpgsql set search_path=''as $$
-declare s public.shifts_v2%rowtype;c public.counterparties%rowtype;o public.supplier_payments%rowtype;cmd public.command_log%rowtype;begin
+declare s public.shifts_v2%rowtype;c public.counterparties%rowtype;o public.supplier_payments%rowtype;r public.supplier_payments%rowtype;cmd public.command_log%rowtype;ap public.approval_requests%rowtype;current_command uuid:=nullif(current_setting('market_pos.current_command_id',true),'')::uuid;begin
  select * into s from public.shifts_v2 where id=new.shift_id;select * into c from public.counterparties where id=new.counterparty_id;select * into cmd from public.command_log where id=new.command_id;
  if s.id is null or(tg_op='INSERT'and s.status<>'open')or s.organization_id<>new.organization_id or s.branch_id<>new.branch_id or s.register_id<>new.register_id or s.currency_code<>new.currency_code or(tg_op='INSERT'and s.business_date<>new.business_date)then raise exception using errcode='P0001',message='V2_SUPPLIER_PAYMENT_SHIFT_SCOPE_MISMATCH';end if;
  if c.id is null or c.organization_id<>new.organization_id then raise exception using errcode='P0001',message='V2_SUPPLIER_PAYMENT_COUNTERPARTY_SCOPE_MISMATCH';end if;
  if not exists(select 1 from public.devices_v2 d where d.id=new.device_id and d.organization_id=new.organization_id and d.branch_id=new.branch_id and d.register_id=new.register_id and d.status='trusted')then raise exception using errcode='P0001',message='V2_SUPPLIER_PAYMENT_DEVICE_SCOPE_MISMATCH';end if;
  if not exists(select 1 from public.organization_memberships m where m.id=new.posted_by and m.organization_id=new.organization_id and m.status='active')or cmd.id is null or cmd.organization_id<>new.organization_id or cmd.branch_id is distinct from new.branch_id or cmd.device_id is distinct from new.device_id then raise exception using errcode='P0001',message='V2_SUPPLIER_PAYMENT_COMMAND_SCOPE_MISMATCH';end if;
  if tg_op='UPDATE'then
-  if old.status<>'posted'or new.status<>'reversed'or(to_jsonb(new)-'status')<>(to_jsonb(old)-'status')then raise exception using errcode='P0001',message='V2_SUPPLIER_PAYMENT_IMMUTABLE';end if;
- elsif new.reversal_of_id is not null then
-  select * into o from public.supplier_payments where id=new.reversal_of_id;
-  if o.id is null or o.reversal_of_id is not null or o.status<>'posted'or o.organization_id<>new.organization_id or o.branch_id<>new.branch_id or o.register_id<>new.register_id or o.counterparty_id<>new.counterparty_id or o.total_amount<>new.total_amount or o.currency_code<>new.currency_code then raise exception using errcode='P0001',message='V2_SUPPLIER_PAYMENT_REVERSAL_MISMATCH';end if;
- end if;return new;
+  select * into r from public.supplier_payments where reversal_of_id=old.id and command_id=current_command;
+  if old.status<>'posted'or new.status<>'reversed'or(to_jsonb(new)-'status')<>(to_jsonb(old)-'status')or current_command is null or r.id is null or r.approval_request_id is null or exists(select 1 from public.supplier_payments z where z.reversal_of_id=old.id and z.id<>r.id)or not exists(select 1 from public.approval_requests q where q.id=r.approval_request_id and q.organization_id=old.organization_id and q.branch_id is not distinct from old.branch_id and q.command_id=r.command_id and q.permission_code='settlements.reverse'and q.status='approved'and q.expires_at>clock_timestamp())then raise exception using errcode='P0001',message='V2_SUPPLIER_PAYMENT_STATUS_GRAPH_MISMATCH';end if;
+  elsif new.reversal_of_id is not null then
+   select * into o from public.supplier_payments where id=new.reversal_of_id;
+   select * into ap from public.approval_requests where id=new.approval_request_id;
+   if o.id is null or o.reversal_of_id is not null or o.status<>'posted'or o.organization_id<>new.organization_id or o.branch_id<>new.branch_id or o.register_id<>new.register_id or o.counterparty_id<>new.counterparty_id or o.total_amount<>new.total_amount or o.currency_code<>new.currency_code or current_command is distinct from new.command_id or ap.id is null or ap.organization_id<>new.organization_id or ap.branch_id is distinct from new.branch_id or ap.command_id<>new.command_id or ap.permission_code<>'settlements.reverse'or ap.status<>'approved'or ap.expires_at<=clock_timestamp()then raise exception using errcode='P0001',message='V2_SUPPLIER_PAYMENT_REVERSAL_MISMATCH';end if;
+  elsif new.approval_request_id is not null then raise exception using errcode='P0001',message='V2_SUPPLIER_PAYMENT_APPROVAL_MISMATCH';
+  end if;return new;
 end$$;
 
 create trigger v2_cash_movements_context before insert on public.cash_movements for each row execute function public.v2_cash_context_required();
@@ -291,6 +295,12 @@ $$;
 create or replace function public.v2_expected_physical_cash(i uuid)returns numeric language sql stable set search_path=''as $$
  select coalesce(sum(amount_delta),0)from public.cash_movements where shift_id=i
 $$;
+create or replace function public.v2_require_cash_drawer_capacity(shift_id uuid,proposed_delta numeric)returns void language plpgsql set search_path=''as $$
+declare expected numeric;begin
+ if proposed_delta>=0 then return;end if;
+ select coalesce(sum(c.amount_delta),0)into expected from public.cash_movements c where c.shift_id=$1;
+ if expected+proposed_delta<0 then raise exception using errcode='P0001',message='V2_CASH_INSUFFICIENT_DRAWER';end if;
+end$$;
 create or replace function public.v2_validate_payment_cash_graph(i uuid)returns void language plpgsql set search_path=''as $$
 begin
  if exists(select 1 from public.payments_v2 p left join public.cash_movements c on c.source_type='payment'and c.source_id=p.id where p.shift_id=i and p.method='cash'and c.id is null)then raise exception using errcode='P0001',message='V2_CASH_PAYMENT_MOVEMENT_MISSING';end if;
@@ -319,14 +329,12 @@ declare p public.payments_v2%rowtype;s public.shifts_v2%rowtype;c public.command
  elsif p.debt_payment_id is not null then mt:='debt_payment';
  elsif p.supplier_payment_id is not null then mt:='supplier_payment';
  else raise exception using errcode='P0001',message='V2_CASH_PAYMENT_SOURCE_MISMATCH';end if;
- if p.reversal_of_id is not null then
-  with recursive chain as(
-   select x.id,x.reversal_of_id,0 depth from public.cash_movements x where x.source_type='payment'and x.source_id=p.reversal_of_id
-   union all select x.id,x.reversal_of_id,q.depth+1 from public.cash_movements x join chain q on x.reversal_of_id=q.id
-  )select x.* into original from chain q join public.cash_movements x on x.id=q.id where not exists(select 1 from public.cash_movements z where z.reversal_of_id=q.id)order by q.depth desc limit 1;
-  if original.id is null or not(original.movement_type=mt or(mt='refund'and original.movement_type='sale'))then raise exception using errcode='P0001',message='V2_CASH_PAYMENT_REVERSAL_MISMATCH';end if;
+ if p.reversal_of_id is not null and not(p.sale_return_id is not null and p.amount<0)then
+  select * into original from public.cash_movements where source_type='payment'and source_id=p.reversal_of_id;
+  if original.id is null or original.movement_type<>mt or p.amount<>-original.amount_delta then raise exception using errcode='P0001',message='V2_CASH_PAYMENT_REVERSAL_MISMATCH';end if;
  end if;
  a:=public.v2_current_membership_id(p.organization_id);if a is null then a:=p.created_by;end if;
+ if p.amount<0 then perform public.v2_require_cash_drawer_capacity(p.shift_id,p.amount);end if;
  perform set_config('market_pos.cash_command','on',true);
  insert into public.cash_movements(organization_id,branch_id,register_id,shift_id,movement_type,amount_delta,currency_code,business_date,source_type,source_id,device_id,local_operation_id,reversal_of_id,command_id,created_by)
  values(p.organization_id,p.branch_id,p.register_id,p.shift_id,mt,p.amount,p.currency_code,s.business_date,'payment',p.id,p.device_id,p.local_operation_id,original.id,command_id,a)returning id into existing;
@@ -383,6 +391,7 @@ declare s public.shifts_v2%rowtype;a uuid;c uuid;i uuid:=gen_random_uuid();delta
  perform public.v2_lock_register_shift_scope(s.organization_id,s.branch_id,s.register_id);select * into s from public.shifts_v2 where id=shift_id for update;
  a:=public.v2_current_membership_id(s.organization_id);perform public.v2_require_open_sales_shift(s.organization_id,s.branch_id,s.register_id,s.id,device_id,a);
  delta:=case movement_type when'cash_in'then amount when'cash_out' then-amount else amount end;
+ if delta<0 then perform public.v2_require_cash_drawer_capacity(s.id,delta);end if;
  perform set_config('market_pos.cash_command','on',true);
  insert into public.cash_movements(id,organization_id,branch_id,register_id,shift_id,movement_type,amount_delta,currency_code,business_date,source_type,source_id,reason,device_id,local_operation_id,command_id,approval_request_id,created_by)
  values(i,s.organization_id,s.branch_id,s.register_id,s.id,movement_type,delta,currency_code,business_date,'command',c,reason,device_id,local_operation_id,c,case when movement_type='correction'then approval_id end,a);
@@ -400,6 +409,7 @@ declare o public.cash_movements%rowtype;s public.shifts_v2%rowtype;a uuid;c uuid
  c:=public.v2_use_approved_command(approval_id,o.organization_id,'cash.move.override',local_operation_id,p);if(select status='succeeded'from public.command_log where id=c)then return(select entity_id from public.command_log where id=c);end if;
  perform public.v2_lock_register_shift_scope(o.organization_id,o.branch_id,o.register_id);select * into s from public.shifts_v2 where id=current_shift_id for update;a:=public.v2_current_membership_id(o.organization_id);perform public.v2_require_open_sales_shift(o.organization_id,o.branch_id,o.register_id,current_shift_id,device_id,a);
  if exists(select 1 from public.cash_movements where reversal_of_id=o.id)then raise exception using errcode='P0001',message='V2_CASH_MOVEMENT_ALREADY_REVERSED';end if;
+ if -o.amount_delta<0 then perform public.v2_require_cash_drawer_capacity(current_shift_id,-o.amount_delta);end if;
  perform set_config('market_pos.cash_command','on',true);
  insert into public.cash_movements(id,organization_id,branch_id,register_id,shift_id,movement_type,amount_delta,currency_code,business_date,source_type,source_id,reason,device_id,local_operation_id,reversal_of_id,command_id,approval_request_id,created_by)
  values(i,o.organization_id,o.branch_id,o.register_id,current_shift_id,o.movement_type,-o.amount_delta,o.currency_code,s.business_date,'command',c,'Controlled reversal',device_id,local_operation_id,o.id,c,approval_id,a);
@@ -417,24 +427,25 @@ create trigger v2_settlement_entries_guard before insert on public.settlement_en
 for each row when(new.source_document_type<>'supplier_payment')execute function public.v2_guard_settlement_entry();
 
 create or replace function public.v2_guard_supplier_settlement_entry()returns trigger language plpgsql set search_path=''as $$
-declare sp public.supplier_payments%rowtype;o public.settlement_entries%rowtype;cmd public.command_log%rowtype;begin
+declare sp public.supplier_payments%rowtype;o public.settlement_entries%rowtype;cmd public.command_log%rowtype;ap public.approval_requests%rowtype;begin
  perform public.v2_lock_settlement_scope(new.organization_id,new.counterparty_id,new.currency_code);
  select * into sp from public.supplier_payments where id=new.source_document_id;select * into cmd from public.command_log where id=new.command_id;
  if sp.id is null or sp.organization_id<>new.organization_id or sp.branch_id<>new.branch_id or sp.counterparty_id<>new.counterparty_id or sp.currency_code<>new.currency_code or sp.command_id<>new.command_id or new.entry_type<>'supplier_payment'or cmd.id is null or cmd.organization_id<>new.organization_id or cmd.status not in('processing','succeeded')then raise exception using errcode='P0001',message='V2_SUPPLIER_SETTLEMENT_SOURCE_MISMATCH';end if;
  if exists(select 1 from public.settlement_periods p where p.organization_id=new.organization_id and p.counterparty_id=new.counterparty_id and p.currency_code=new.currency_code and p.status in('closed','corrected')and new.business_date>=p.starts_on and new.business_date<p.ends_on)then raise exception using errcode='P0001',message='V2_SETTLEMENT_PERIOD_CLOSED';end if;
  if sp.reversal_of_id is null then
   if new.reversal_of_id is not null or new.amount_delta<>sp.total_amount then raise exception using errcode='P0001',message='V2_SUPPLIER_SETTLEMENT_SOURCE_MISMATCH';end if;
- else
-  select * into o from public.settlement_entries where id=new.reversal_of_id;
-  if o.id is null or o.reversal_of_id is not null or o.source_document_type<>'supplier_payment'or o.source_document_id<>sp.reversal_of_id or o.organization_id<>new.organization_id or o.branch_id<>new.branch_id or o.counterparty_id<>new.counterparty_id or o.currency_code<>new.currency_code or new.amount_delta<>-o.amount_delta or new.amount_delta<>-sp.total_amount then raise exception using errcode='P0001',message='V2_SUPPLIER_SETTLEMENT_REVERSAL_MISMATCH';end if;
- end if;
- if new.approval_request_id is not null and not exists(select 1 from public.approval_requests a where a.id=new.approval_request_id and a.organization_id=new.organization_id and a.command_id=new.command_id and a.status='approved')then raise exception using errcode='P0001',message='V2_SUPPLIER_SETTLEMENT_APPROVAL_MISMATCH';end if;return new;
+  else
+   select * into o from public.settlement_entries where id=new.reversal_of_id;
+   select * into ap from public.approval_requests where id=new.approval_request_id;
+   if o.id is null or o.reversal_of_id is not null or o.source_document_type<>'supplier_payment'or o.source_document_id<>sp.reversal_of_id or o.organization_id<>new.organization_id or o.branch_id<>new.branch_id or o.counterparty_id<>new.counterparty_id or o.currency_code<>new.currency_code or new.amount_delta<>-o.amount_delta or new.amount_delta<>-sp.total_amount or sp.approval_request_id is distinct from new.approval_request_id or ap.id is null or ap.organization_id<>new.organization_id or ap.branch_id is distinct from new.branch_id or ap.command_id<>new.command_id or ap.permission_code<>'settlements.reverse'or ap.status<>'approved'or ap.expires_at<=clock_timestamp()then raise exception using errcode='P0001',message='V2_SUPPLIER_SETTLEMENT_REVERSAL_MISMATCH';end if;
+  end if;
+ if sp.reversal_of_id is null and new.approval_request_id is not null then raise exception using errcode='P0001',message='V2_SUPPLIER_SETTLEMENT_APPROVAL_MISMATCH';end if;return new;
 end$$;
 create trigger v2_settlement_entries_guard_supplier before insert on public.settlement_entries
 for each row when(new.source_document_type='supplier_payment')execute function public.v2_guard_supplier_settlement_entry();
 
 create or replace function public.v2_record_supplier_payment(organization_id uuid,branch_id uuid,register_id uuid,current_shift_id uuid,counterparty_id uuid,document_number text,business_date date,currency_code char(3),device_id uuid,local_operation_id uuid,client_created_at timestamptz,payments jsonb)returns uuid language plpgsql security definer set search_path=''as $$
-declare s public.shifts_v2%rowtype;a uuid;c uuid;i uuid:=gen_random_uuid();entry_id uuid:=gen_random_uuid();p jsonb:=jsonb_build_object('organization_id',organization_id,'branch_id',branch_id,'register_id',register_id,'current_shift_id',current_shift_id,'counterparty_id',counterparty_id,'document_number',document_number,'business_date',business_date,'currency_code',currency_code,'device_id',device_id,'client_created_at',client_created_at,'payments',payments);item jsonb;total numeric:=0;pay_id uuid;balance numeric;begin
+declare s public.shifts_v2%rowtype;cp public.counterparties%rowtype;a uuid;c uuid;i uuid:=gen_random_uuid();entry_id uuid:=gen_random_uuid();p jsonb:=jsonb_build_object('organization_id',organization_id,'branch_id',branch_id,'register_id',register_id,'current_shift_id',current_shift_id,'counterparty_id',counterparty_id,'document_number',document_number,'business_date',business_date,'currency_code',currency_code,'device_id',device_id,'client_created_at',client_created_at,'payments',payments);item jsonb;total numeric:=0;pay_id uuid;balance numeric;begin
  if not public.v2_has_permission(organization_id,'settlements.manage',branch_id)then raise exception using errcode='P0001',message='V2_SETTLEMENTS_MANAGE_REQUIRED';end if;
  if document_number is null or btrim(document_number)=''or jsonb_typeof(payments)<>'array'or jsonb_array_length(payments)=0 then raise exception using errcode='P0001',message='V2_SUPPLIER_PAYMENT_INPUT_INVALID';end if;
  for item in select value from jsonb_array_elements(payments)loop
@@ -444,7 +455,9 @@ declare s public.shifts_v2%rowtype;a uuid;c uuid;i uuid:=gen_random_uuid();entry
  c:=public.v2_begin_inventory_command(organization_id,branch_id,device_id,local_operation_id,'supplier_payment.record',p);if(select status='succeeded'from public.command_log where id=c)then return(select entity_id from public.command_log where id=c);end if;
  perform public.v2_lock_register_shift_scope(organization_id,branch_id,register_id);select * into s from public.shifts_v2 where id=current_shift_id for update;a:=public.v2_current_membership_id(organization_id);perform public.v2_require_open_sales_shift(organization_id,branch_id,register_id,current_shift_id,device_id,a);
  if s.currency_code<>currency_code or s.business_date<>business_date then raise exception using errcode='P0001',message='V2_SUPPLIER_PAYMENT_SHIFT_SCOPE_MISMATCH';end if;
- perform public.v2_lock_settlement_scope(organization_id,counterparty_id,currency_code);balance:=public.v2_counterparty_balance(organization_id,counterparty_id,currency_code);
+ perform public.v2_lock_settlement_scope(organization_id,counterparty_id,currency_code);select x.* into cp from public.counterparties x where x.id=$5 and x.organization_id=$1 for update;
+ if cp.id is null or not exists(select 1 from public.counterparty_roles cr where cr.organization_id=$1 and cr.counterparty_id=$5 and cr.role_code='supplier')or(cp.status='archived'and not exists(select 1 from public.counterparty_roles cr where cr.organization_id=$1 and cr.counterparty_id=$5 and cr.role_code='supplier'and cr.ended_at is not null))then raise exception using errcode='P0001',message='V2_SUPPLIER_ROLE_HISTORY_REQUIRED';end if;
+ balance:=public.v2_counterparty_balance(organization_id,counterparty_id,currency_code);
  if balance>=0 or total>abs(balance)then raise exception using errcode='P0001',message='V2_SUPPLIER_PAYMENT_EXCEEDS_PAYABLE';end if;
  perform set_config('market_pos.supplier_payment_command','on',true);perform set_config('market_pos.sales_command','on',true);perform set_config('market_pos.settlement_command','on',true);
  insert into public.supplier_payments(id,organization_id,branch_id,register_id,counterparty_id,shift_id,document_number,business_date,total_amount,currency_code,device_id,local_operation_id,client_created_at,posted_by,command_id)
@@ -514,6 +527,7 @@ declare s public.shifts_v2%rowtype;a uuid;c uuid;p jsonb;item jsonb;expected_cas
  perform public.v2_validate_shift_close_snapshot(i,c);
  select expected_amount into cash_expected from public.v2_recompute_shift_payment_totals(i)where payment_method='cash';select expected_amount into card_expected from public.v2_recompute_shift_payment_totals(i)where payment_method='card';select expected_amount into transfer_expected from public.v2_recompute_shift_payment_totals(i)where payment_method='transfer';
  expected_cash:=public.v2_expected_physical_cash(i);select coalesce(sum(amount_delta),0)into manual_delta from public.cash_movements where shift_id=i and source_type='command';cash_actual_equiv:=actual_cash-s.opening_cash_amount-manual_delta;
+ if expected_cash<0 then raise exception using errcode='P0001',message='V2_CASH_INSUFFICIENT_DRAWER';end if;
  for item in select value from jsonb_array_elements(counts)loop
   insert into public.shift_cash_counts(organization_id,branch_id,register_id,shift_id,line_number,denomination_value,quantity,counted_amount,currency_code,command_id,counted_by)
   values(s.organization_id,s.branch_id,s.register_id,i,(item->>'line_number')::integer,(item->>'denomination_value')::numeric,(item->>'quantity')::integer,(item->>'denomination_value')::numeric*(item->>'quantity')::integer,s.currency_code,c,a);
@@ -550,27 +564,26 @@ create or replace function public.v2_post_sale(o uuid,b uuid,r uuid,w uuid,sh uu
 declare i uuid;c uuid;pmt record;begin
  -- The 0015 base retains FOR UPDATE, V2_SALE_DEBT_DUE_DATE_INVALID,
  -- V2_SALE_MULTIPLE_APPROVALS_REQUIRED and limit_override_approval_id checks.
- if customer is not null then perform public.v2_lock_settlement_scope(o,customer,cur);end if;perform public.v2_lock_register_shift_scope(o,b,r);
+ perform public.v2_lock_register_shift_scope(o,b,r);if customer is not null then perform public.v2_lock_settlement_scope(o,customer,cur);end if;
  i:=public.v2_post_sale_0015_cash_base(o,b,r,w,sh,customer,n,bd,cur,d,op,client_at,lines,pays,approval,debt_terms);c:=nullif(current_setting('market_pos.current_command_id',true),'')::uuid;for pmt in select id from public.payments_v2 where sale_id=i order by id loop perform public.v2_append_cash_movement_for_payment(pmt.id,c);end loop;return i;end$$;
 create or replace function public.v2_post_sale_return(sale uuid,sh uuid,n text,d uuid,op uuid,lines jsonb,pays jsonb)returns uuid language plpgsql security definer set search_path=''as $$
-declare i uuid;c uuid;sr public.sale_returns%rowtype;s public.sales_v2%rowtype;pmt record;begin
- -- v2_lock_settlement_scope is acquired by the hardened 0015 base before settlement reads.
- i:=public.v2_post_sale_return_0015_cash_base(sale,sh,n,d,op,lines,pays);c:=nullif(current_setting('market_pos.current_command_id',true),'')::uuid;select * into sr from public.sale_returns where id=i;select * into s from public.sales_v2 where id=sr.original_sale_id;perform public.v2_lock_register_shift_scope(sr.organization_id,s.branch_id,sr.register_id);for pmt in select id from public.payments_v2 where sale_return_id=i order by id loop perform public.v2_append_cash_movement_for_payment(pmt.id,c);end loop;return i;end$$;
+declare i uuid;c uuid;s public.sales_v2%rowtype;rec public.receivables%rowtype;pmt record;begin
+ select * into s from public.sales_v2 where id=sale;if not found then raise exception using errcode='P0001',message='V2_SALE_NOT_FOUND';end if;perform public.v2_lock_register_shift_scope(s.organization_id,s.branch_id,s.register_id);select * into rec from public.receivables where sale_id=sale;if rec.id is not null then perform public.v2_lock_settlement_scope(rec.organization_id,rec.counterparty_id,rec.currency_code);end if;
+ i:=public.v2_post_sale_return_0015_cash_base(sale,sh,n,d,op,lines,pays);c:=nullif(current_setting('market_pos.current_command_id',true),'')::uuid;for pmt in select id from public.payments_v2 where sale_return_id=i order by id loop perform public.v2_append_cash_movement_for_payment(pmt.id,c);end loop;return i;end$$;
 create or replace function public.v2_reverse_sale(sale uuid,sh uuid,n text,d uuid,op uuid,approval uuid,payload jsonb default'{}')returns uuid language plpgsql security definer set search_path=''as $$
-declare i uuid;c uuid;s public.sales_v2%rowtype;pmt record;begin
- -- v2_lock_settlement_scope, v2_lock_inventory_scopes and reversal_of_id validation
- -- are retained by the hardened 0015 base before financial mutation.
- i:=public.v2_reverse_sale_0015_cash_base(sale,sh,n,d,op,approval,payload);c:=nullif(current_setting('market_pos.current_command_id',true),'')::uuid;select * into s from public.sales_v2 where id=i;perform public.v2_lock_register_shift_scope(s.organization_id,s.branch_id,s.register_id);for pmt in select id from public.payments_v2 where sale_id=i order by id loop perform public.v2_append_cash_movement_for_payment(pmt.id,c);end loop;return i;end$$;
+declare i uuid;c uuid;s public.sales_v2%rowtype;rec public.receivables%rowtype;pmt record;begin
+ select * into s from public.sales_v2 where id=sale;if not found then raise exception using errcode='P0001',message='V2_SALE_NOT_FOUND';end if;perform public.v2_lock_register_shift_scope(s.organization_id,s.branch_id,s.register_id);select * into rec from public.receivables where sale_id=sale;if rec.id is not null then perform public.v2_lock_settlement_scope(rec.organization_id,rec.counterparty_id,rec.currency_code);end if;
+ i:=public.v2_reverse_sale_0015_cash_base(sale,sh,n,d,op,approval,payload);c:=nullif(current_setting('market_pos.current_command_id',true),'')::uuid;for pmt in select id from public.payments_v2 where sale_id=i order by id loop perform public.v2_append_cash_movement_for_payment(pmt.id,c);end loop;return i;end$$;
 create or replace function public.v2_reverse_sale_return(ret uuid,sh uuid,n text,d uuid,op uuid,approval uuid,payload jsonb default'{}')returns uuid language plpgsql security definer set search_path=''as $$
-declare i uuid;c uuid;sr public.sale_returns%rowtype;s public.sales_v2%rowtype;pmt record;begin
- -- v2_lock_settlement_scope is acquired by the hardened 0015 base before settlement reads.
- i:=public.v2_reverse_sale_return_0015_cash_base(ret,sh,n,d,op,approval,payload);c:=nullif(current_setting('market_pos.current_command_id',true),'')::uuid;select * into sr from public.sale_returns where id=i;select * into s from public.sales_v2 where id=sr.original_sale_id;perform public.v2_lock_register_shift_scope(sr.organization_id,s.branch_id,sr.register_id);for pmt in select id from public.payments_v2 where sale_return_id=i order by id loop perform public.v2_append_cash_movement_for_payment(pmt.id,c);end loop;return i;end$$;
+declare i uuid;c uuid;sr public.sale_returns%rowtype;s public.sales_v2%rowtype;rec public.receivables%rowtype;pmt record;begin
+ select * into sr from public.sale_returns where id=ret;if not found then raise exception using errcode='P0001',message='V2_SALE_RETURN_NOT_FOUND';end if;select * into s from public.sales_v2 where id=sr.original_sale_id;perform public.v2_lock_register_shift_scope(sr.organization_id,s.branch_id,sr.register_id);select * into rec from public.receivables where sale_id=s.id;if rec.id is not null then perform public.v2_lock_settlement_scope(rec.organization_id,rec.counterparty_id,rec.currency_code);end if;
+ i:=public.v2_reverse_sale_return_0015_cash_base(ret,sh,n,d,op,approval,payload);c:=nullif(current_setting('market_pos.current_command_id',true),'')::uuid;for pmt in select id from public.payments_v2 where sale_return_id=i order by id loop perform public.v2_append_cash_movement_for_payment(pmt.id,c);end loop;return i;end$$;
 create or replace function public.v2_record_debt_payment(organization_id uuid,branch_id uuid,register_id uuid,current_shift_id uuid,counterparty_id uuid,document_number text,business_date date,currency_code char(3),device_id uuid,local_operation_id uuid,client_created_at timestamptz,payments jsonb,allocations jsonb)returns uuid language plpgsql security definer set search_path=''as $$
-declare i uuid;c uuid;pmt record;begin perform public.v2_lock_settlement_scope(organization_id,counterparty_id,currency_code);perform public.v2_lock_register_shift_scope(organization_id,branch_id,register_id);i:=public.v2_record_debt_payment_0015_cash_base(organization_id,branch_id,register_id,current_shift_id,counterparty_id,document_number,business_date,currency_code,device_id,local_operation_id,client_created_at,payments,allocations);c:=nullif(current_setting('market_pos.current_command_id',true),'')::uuid;for pmt in select id from public.payments_v2 where debt_payment_id=i order by id loop perform public.v2_append_cash_movement_for_payment(pmt.id,c);end loop;return i;end$$;
+declare i uuid;c uuid;pmt record;begin perform public.v2_lock_register_shift_scope(organization_id,branch_id,register_id);perform public.v2_lock_settlement_scope(organization_id,counterparty_id,currency_code);i:=public.v2_record_debt_payment_0015_cash_base(organization_id,branch_id,register_id,current_shift_id,counterparty_id,document_number,business_date,currency_code,device_id,local_operation_id,client_created_at,payments,allocations);c:=nullif(current_setting('market_pos.current_command_id',true),'')::uuid;for pmt in select id from public.payments_v2 where debt_payment_id=i order by id loop perform public.v2_append_cash_movement_for_payment(pmt.id,c);end loop;return i;end$$;
 create or replace function public.v2_reverse_debt_payment(debt_payment_id uuid,current_shift_id uuid,document_number text,device_id uuid,local_operation_id uuid,approval_id uuid,payload jsonb default'{}')returns uuid language plpgsql security definer set search_path=''as $$
 declare i uuid;c uuid;dp public.debt_payments_v2%rowtype;pmt record;begin
- -- v2_lock_settlement_scope is acquired by the hardened 0015 base before settlement reads.
- i:=public.v2_reverse_debt_payment_0015_cash_base(debt_payment_id,current_shift_id,document_number,device_id,local_operation_id,approval_id,payload);c:=nullif(current_setting('market_pos.current_command_id',true),'')::uuid;select * into dp from public.debt_payments_v2 where id=i;perform public.v2_lock_register_shift_scope(dp.organization_id,dp.branch_id,dp.register_id);for pmt in select p0.id from public.payments_v2 p0 where p0.debt_payment_id=i order by p0.id loop perform public.v2_append_cash_movement_for_payment(pmt.id,c);end loop;return i;end$$;
+ select * into dp from public.debt_payments_v2 where id=debt_payment_id;if not found then raise exception using errcode='P0001',message='V2_DEBT_PAYMENT_NOT_FOUND';end if;perform public.v2_lock_register_shift_scope(dp.organization_id,dp.branch_id,dp.register_id);perform public.v2_lock_settlement_scope(dp.organization_id,dp.counterparty_id,dp.currency_code);
+ i:=public.v2_reverse_debt_payment_0015_cash_base(debt_payment_id,current_shift_id,document_number,device_id,local_operation_id,approval_id,payload);c:=nullif(current_setting('market_pos.current_command_id',true),'')::uuid;for pmt in select p0.id from public.payments_v2 p0 where p0.debt_payment_id=i order by p0.id loop perform public.v2_append_cash_movement_for_payment(pmt.id,c);end loop;return i;end$$;
 
 -- RLS and safe read surfaces -------------------------------------------------
 create or replace function public.v2_cash_journal(o uuid,b uuid,sh uuid)
@@ -592,12 +605,20 @@ declare s public.shifts_v2%rowtype;totals jsonb;begin select * into s from publi
  return query select s.id,s.status,s.currency_code,s.expected_cash_amount,s.actual_cash_amount,s.difference_amount,coalesce(totals,'{}'::jsonb);
 end$$;
 
-create or replace function public.v2_supplier_payment_journal(o uuid,b uuid,cp uuid)
+create or replace function public.v2_supplier_payment_journal(o uuid,b uuid,cp uuid,cur char(3))
 returns table(id uuid,document_number text,business_date date,total_amount numeric,currency_code char(3),status text,reversal_of_id uuid,posted_at timestamptz)
 language plpgsql stable security definer set search_path=''as $$
 begin
- if not(public.v2_has_permission(o,'settlements.view',b)or public.v2_has_permission(o,'settlements.manage',b)or public.v2_has_support_grant(o,'settlements.view'))or not public.v2_can_view_full_settlement_scope(o,cp,(select p0.currency_code from public.supplier_payments p0 where p0.organization_id=o and p0.counterparty_id=cp order by p0.posted_at desc limit 1),null,null)then raise exception using errcode='P0001',message='V2_SETTLEMENT_FULL_VISIBILITY_REQUIRED';end if;
- return query select p.id,p.document_number,p.business_date,p.total_amount,p.currency_code,p.status,p.reversal_of_id,p.posted_at from public.supplier_payments p where p.organization_id=o and p.branch_id=b and p.counterparty_id=cp order by p.business_date,p.posted_at,p.id;
+ if cur is null or not(public.v2_has_permission(o,'settlements.view',b)or public.v2_has_permission(o,'settlements.manage',b)or public.v2_has_support_grant(o,'settlements.view'))or not public.v2_can_view_full_settlement_scope(o,cp,cur,null,null)then raise exception using errcode='P0001',message='V2_SETTLEMENT_FULL_VISIBILITY_REQUIRED';end if;
+ return query select p.id,p.document_number,p.business_date,p.total_amount,p.currency_code,p.status,p.reversal_of_id,p.posted_at from public.supplier_payments p where p.organization_id=o and p.branch_id=b and p.counterparty_id=cp and p.currency_code=cur order by p.business_date,p.posted_at,p.id;
+end$$;
+create or replace function public.v2_supplier_payment_journal(o uuid,b uuid,cp uuid)
+returns table(id uuid,document_number text,business_date date,total_amount numeric,currency_code char(3),status text,reversal_of_id uuid,posted_at timestamptz)
+language plpgsql stable security definer set search_path=''as $$
+declare cur char(3);currency_count integer;begin
+ select count(distinct p.currency_code),min(p.currency_code)into currency_count,cur from public.supplier_payments p where p.organization_id=o and p.branch_id=b and p.counterparty_id=cp;
+ if currency_count<>1 then raise exception using errcode='P0001',message='V2_SUPPLIER_PAYMENT_CURRENCY_REQUIRED';end if;
+ return query select * from public.v2_supplier_payment_journal(o,b,cp,cur);
 end$$;
 
 alter table public.cash_movements enable row level security;
@@ -618,8 +639,8 @@ create policy supplier_payments_owner_select on public.supplier_payments for sel
 revoke all on public.cash_movements,public.shift_cash_counts,public.supplier_payments from anon,authenticated,service_role;
 grant select on public.cash_movements,public.shift_cash_counts,public.supplier_payments to authenticated;
 
-revoke execute on function public.v2_lock_register_shift_scope(uuid,uuid,uuid),public.v2_cash_context_required(),public.v2_cash_append_only(),public.v2_supplier_payment_context_required(),public.v2_guard_cash_movement(),public.v2_guard_shift_cash_count(),public.v2_guard_supplier_payment(),public.v2_guard_supplier_settlement_entry(),public.v2_recompute_shift_payment_totals(uuid),public.v2_expected_physical_cash(uuid),public.v2_validate_payment_cash_graph(uuid),public.v2_cash_count_total(uuid,uuid),public.v2_validate_shift_close_snapshot(uuid,uuid),public.v2_append_cash_movement_for_payment(uuid,uuid),public.v2_post_sale_0015_cash_base(uuid,uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamptz,jsonb,jsonb,uuid,jsonb),public.v2_post_sale_return_0015_cash_base(uuid,uuid,text,uuid,uuid,jsonb,jsonb),public.v2_reverse_sale_0015_cash_base(uuid,uuid,text,uuid,uuid,uuid,jsonb),public.v2_reverse_sale_return_0015_cash_base(uuid,uuid,text,uuid,uuid,uuid,jsonb),public.v2_record_debt_payment_0015_cash_base(uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamptz,jsonb,jsonb),public.v2_reverse_debt_payment_0015_cash_base(uuid,uuid,text,uuid,uuid,uuid,jsonb)from public,anon,authenticated;
-revoke execute on function public.v2_cash_journal(uuid,uuid,uuid),public.v2_shift_reconciliation(uuid),public.v2_supplier_payment_journal(uuid,uuid,uuid),public.v2_open_shift(uuid,uuid,uuid,uuid,numeric,character,date,uuid),public.v2_open_shift(uuid,uuid,uuid,uuid,numeric,uuid),public.v2_record_cash_movement(uuid,uuid,text,numeric,character,date,text,uuid,uuid),public.v2_reverse_cash_movement(uuid,uuid,uuid,uuid,uuid,jsonb),public.v2_record_supplier_payment(uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamptz,jsonb),public.v2_reverse_supplier_payment(uuid,uuid,text,uuid,uuid,uuid,jsonb),public.v2_close_shift(uuid,uuid,jsonb,jsonb,uuid,uuid),public.v2_close_shift(uuid,uuid,numeric,uuid)from public,anon;
-grant execute on function public.v2_cash_journal(uuid,uuid,uuid),public.v2_shift_reconciliation(uuid),public.v2_supplier_payment_journal(uuid,uuid,uuid),public.v2_open_shift(uuid,uuid,uuid,uuid,numeric,character,date,uuid),public.v2_open_shift(uuid,uuid,uuid,uuid,numeric,uuid),public.v2_record_cash_movement(uuid,uuid,text,numeric,character,date,text,uuid,uuid),public.v2_reverse_cash_movement(uuid,uuid,uuid,uuid,uuid,jsonb),public.v2_record_supplier_payment(uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamptz,jsonb),public.v2_reverse_supplier_payment(uuid,uuid,text,uuid,uuid,uuid,jsonb),public.v2_close_shift(uuid,uuid,jsonb,jsonb,uuid,uuid),public.v2_close_shift(uuid,uuid,numeric,uuid)to authenticated;
+revoke execute on function public.v2_lock_register_shift_scope(uuid,uuid,uuid),public.v2_cash_context_required(),public.v2_cash_append_only(),public.v2_supplier_payment_context_required(),public.v2_guard_cash_movement(),public.v2_guard_shift_cash_count(),public.v2_guard_supplier_payment(),public.v2_guard_supplier_settlement_entry(),public.v2_recompute_shift_payment_totals(uuid),public.v2_expected_physical_cash(uuid),public.v2_require_cash_drawer_capacity(uuid,numeric),public.v2_validate_payment_cash_graph(uuid),public.v2_cash_count_total(uuid,uuid),public.v2_validate_shift_close_snapshot(uuid,uuid),public.v2_append_cash_movement_for_payment(uuid,uuid),public.v2_post_sale_0015_cash_base(uuid,uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamptz,jsonb,jsonb,uuid,jsonb),public.v2_post_sale_return_0015_cash_base(uuid,uuid,text,uuid,uuid,jsonb,jsonb),public.v2_reverse_sale_0015_cash_base(uuid,uuid,text,uuid,uuid,uuid,jsonb),public.v2_reverse_sale_return_0015_cash_base(uuid,uuid,text,uuid,uuid,uuid,jsonb),public.v2_record_debt_payment_0015_cash_base(uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamptz,jsonb,jsonb),public.v2_reverse_debt_payment_0015_cash_base(uuid,uuid,text,uuid,uuid,uuid,jsonb)from public,anon,authenticated;
+revoke execute on function public.v2_cash_journal(uuid,uuid,uuid),public.v2_shift_reconciliation(uuid),public.v2_supplier_payment_journal(uuid,uuid,uuid),public.v2_supplier_payment_journal(uuid,uuid,uuid,character),public.v2_open_shift(uuid,uuid,uuid,uuid,numeric,character,date,uuid),public.v2_open_shift(uuid,uuid,uuid,uuid,numeric,uuid),public.v2_record_cash_movement(uuid,uuid,text,numeric,character,date,text,uuid,uuid),public.v2_reverse_cash_movement(uuid,uuid,uuid,uuid,uuid,jsonb),public.v2_record_supplier_payment(uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamptz,jsonb),public.v2_reverse_supplier_payment(uuid,uuid,text,uuid,uuid,uuid,jsonb),public.v2_close_shift(uuid,uuid,jsonb,jsonb,uuid,uuid),public.v2_close_shift(uuid,uuid,numeric,uuid)from public,anon;
+grant execute on function public.v2_cash_journal(uuid,uuid,uuid),public.v2_shift_reconciliation(uuid),public.v2_supplier_payment_journal(uuid,uuid,uuid),public.v2_supplier_payment_journal(uuid,uuid,uuid,character),public.v2_open_shift(uuid,uuid,uuid,uuid,numeric,character,date,uuid),public.v2_open_shift(uuid,uuid,uuid,uuid,numeric,uuid),public.v2_record_cash_movement(uuid,uuid,text,numeric,character,date,text,uuid,uuid),public.v2_reverse_cash_movement(uuid,uuid,uuid,uuid,uuid,jsonb),public.v2_record_supplier_payment(uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamptz,jsonb),public.v2_reverse_supplier_payment(uuid,uuid,text,uuid,uuid,uuid,jsonb),public.v2_close_shift(uuid,uuid,jsonb,jsonb,uuid,uuid),public.v2_close_shift(uuid,uuid,numeric,uuid)to authenticated;
 revoke execute on function public.v2_post_sale(uuid,uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamptz,jsonb,jsonb,uuid,jsonb),public.v2_post_sale_return(uuid,uuid,text,uuid,uuid,jsonb,jsonb),public.v2_reverse_sale(uuid,uuid,text,uuid,uuid,uuid,jsonb),public.v2_reverse_sale_return(uuid,uuid,text,uuid,uuid,uuid,jsonb),public.v2_record_debt_payment(uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamptz,jsonb,jsonb),public.v2_reverse_debt_payment(uuid,uuid,text,uuid,uuid,uuid,jsonb)from public,anon;
 grant execute on function public.v2_post_sale(uuid,uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamptz,jsonb,jsonb,uuid,jsonb),public.v2_post_sale_return(uuid,uuid,text,uuid,uuid,jsonb,jsonb),public.v2_reverse_sale(uuid,uuid,text,uuid,uuid,uuid,jsonb),public.v2_reverse_sale_return(uuid,uuid,text,uuid,uuid,uuid,jsonb),public.v2_record_debt_payment(uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamptz,jsonb,jsonb),public.v2_reverse_debt_payment(uuid,uuid,text,uuid,uuid,uuid,jsonb)to authenticated;
