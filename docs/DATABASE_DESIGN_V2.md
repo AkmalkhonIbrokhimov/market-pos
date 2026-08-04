@@ -1374,9 +1374,9 @@ Checks `0 <= outstanding <= original`; unique sale; indexes customer/status/due 
 
 ## 51. Погашения долга
 
-### `debt_payments`
+### `debt_payments_v2`
 
-**Контракт:** Debts; repayment document, linked payments. PK id; branch/customer/shift/device; RLS authorized; insert only `record_debt_payment`; immutable/delete forbidden; reversal document; outbox `DebtPaymentRecorded/Reversed`; offline allowed within policy.
+**Контракт:** Debts; repayment document, linked payments. Физическое имя V2 в coexistence — `public.debt_payments_v2`; `public.debt_payments` остаётся неизменной legacy V1 table без backfill и dual-write. PK id; branch/register/customer/shift/device; RLS authorized; insert only `record_debt_payment`; immutable/delete forbidden; reversal document в текущей открытой смене; outbox `DebtPaymentRecorded/Reversed`; offline allowed within policy.
 
 | Поле | PostgreSQL type | Null | Default | Назначение |
 | --- | --- | --- | --- | --- |
@@ -1409,13 +1409,14 @@ Checks amount >0; unique operation scope. Sum linked payment rows equals total.
 | receivable_id | uuid | нет | — | Debt |
 | debt_payment_id | uuid | да | — | Repayment |
 | sale_return_id | uuid | да | — | Return reduction |
-| allocation_type | text | нет | — | payment/return/write_off/reversal |
+| sale_reversal_id | uuid | да | — | Sale reversal source |
+| allocation_type | text | нет | — | payment/return/write_off/sale_reversal |
 | amount | numeric(18,4) | нет | — | Signed |
 | reversal_of_id | uuid | да | — | Original |
 | created_by | uuid | нет | — | Actor |
 | created_at | timestamptz | нет | now() | Time |
 
-Exactly one source, nonzero amount. Function locks receivable and refuses allocation over outstanding. Reconciliation: original amount minus allocations equals projection.
+Primary allocation имеет положительную сумму. Reversal не является отдельным `allocation_type`: это точная отрицательная строка того же типа с `reversal_of_id`, и на primary allocation разрешён максимум один reversal. Function locks receivable and refuses allocation over outstanding. Reconciliation: `outstanding_amount = original_amount - sum(all signed debt_allocations.amount)`.
 
 ```mermaid
 erDiagram
@@ -1426,8 +1427,8 @@ erDiagram
   SALES ||--o{ SALE_RETURNS : returned_by
   SALE_RETURNS ||--|{ SALE_RETURN_LINES : contains
   RECEIVABLES ||--o{ DEBT_ALLOCATIONS : reduced_by
-  DEBT_PAYMENTS ||--o{ PAYMENTS : receives
-  DEBT_PAYMENTS ||--o{ DEBT_ALLOCATIONS : allocates
+  DEBT_PAYMENTS_V2 ||--o{ PAYMENTS : receives
+  DEBT_PAYMENTS_V2 ||--o{ DEBT_ALLOCATIONS : allocates
 ```
 
 ## 53. Взаиморасчёты с контрагентами
@@ -1438,7 +1439,7 @@ Settlements использует единый signed ledger: положител�
 
 ### `settlement_entries`
 
-**Контракт:** Settlements append-only source. FK counterparty/source/period/reversal restrict; RLS owner/settlement permission; insert posting functions; update/delete forbidden; reversal opposite row; outbox `SettlementEntryPosted`; offline owner projection only.
+**Контракт:** Settlements append-only source. Положительный `amount_delta` означает долг контрагента организации, отрицательный — долг организации контрагенту. FK counterparty/source/reversal restrict; period определяется только immutable `business_date` interval и act-line snapshot; RLS owner/settlement permission; insert posting functions; update/delete forbidden; reversal opposite row; outbox `SettlementEntryPosted`; offline owner projection only.
 
 | Поле | PostgreSQL type | Null | Default | Назначение |
 | --- | --- | --- | --- | --- |
@@ -1452,7 +1453,6 @@ Settlements использует единый signed ledger: положител�
 | business_date | date | нет | — | Date |
 | source_document_type | text | нет | — | Source |
 | source_document_id | uuid | нет | — | Header |
-| settlement_period_id | uuid | да | — | Closed period |
 | reversal_of_id | uuid | да | — | Original |
 | created_by | uuid | нет | — | Actor |
 | created_at | timestamptz | нет | now() | Time |
@@ -1470,6 +1470,7 @@ Unique `(source_document_type,source_document_id,entry_type)` as appropriate; am
 | id | uuid | нет | gen_random_uuid() | Period |
 | organization_id | uuid | нет | — | Tenant |
 | counterparty_id | uuid | нет | — | Party |
+| currency_code | char(3) | нет | — | Mandatory currency scope |
 | starts_on | date | нет | — | Inclusive |
 | ends_on | date | нет | — | Exclusive |
 | status | text | нет | `'open'` | open/closed/corrected |
@@ -1509,7 +1510,7 @@ Unique `(source_document_type,source_document_id,entry_type)` as appropriate; am
 | line_number | integer | нет | — | Order |
 | amount_delta | numeric(18,4) | нет | — | Snapshot |
 
-Periods for one counterparty/currency cannot overlap (exclusion constraint). Act number unique tenant. Closed period blocks new entries with business date inside; correction points to later period.
+Periods for one counterparty/currency cannot overlap (exclusion constraint). Act number unique tenant. Closed period blocks new entries with business date inside; correction points to later period. `settlement_entries` не содержит `settlement_period_id`: immutable membership фиксируется только ordered `settlement_act_lines`, а canonical hash включает schema version, tenant, counterparty, currency, range, balances и ordered entry data.
 
 ```mermaid
 erDiagram
@@ -2162,6 +2163,93 @@ Reconciliation jobs пишут result/cutoff, но не исправляют led
 
 Файлы предлагаются, но на этом этапе не создаются.
 
+### Реализованный контракт migration 0015
+
+Migration 0015 добавляет семь V2 tables: `receivables`, физическую
+`debt_payments_v2`, `debt_allocations`, `settlement_entries`,
+`settlement_periods`, `settlement_acts` и `settlement_act_lines`. Legacy
+`public.debt_payments` не изменяется. Registry содержит 51 permission, из них
+9 critical; owner template содержит 51, seller template остаётся 16. Новые
+critical permissions `debts.reverse`, `debts.write_off` и `settlements.close`
+назначаются только system owner profile.
+
+Debt sale вычисляет долг сервером как total минус confirmed immediate payments.
+`v2_post_sale(..., approval_id)` сохранён как fully-paid-compatible wrapper над
+новым overload `v2_post_sale(..., approval_id, debt_terms)`. Клиент не передаёт
+authoritative debt amount. Пустой payments array означает full debt, а неполная
+сумма confirmed payments — mixed payment/debt. `debt_terms` допускает только
+`due_date` и `limit_override_approval_id`; без due date она равна
+`business_date + max_due_days`, а дата раньше `business_date` запрещена
+(`V2_SALE_DEBT_DUE_DATE_INVALID`). Credit exposure считается organization-wide
+по всем branch как сумма открытых receivable одной
+organization/counterparty/currency. Exact settlement scope сначала получает
+transaction advisory lock, затем блокируются counterparty и credit settings,
+и лишь после этого читается exposure. Поэтому две параллельные credit sale не
+могут вместе превысить limit. Новый долг требует active
+customer role и действующих credit settings; превышение limit, disabled credit
+или due date вне terms требует `debts.limit.override` с approved critical
+request. Если одновременно нужны `sales.discount.override` и
+`debts.limit.override`, используются два разных exact approved request одного
+command/payload; discount approval остаётся публичным аргументом, debt approval
+передаётся как `debt_terms.limit_override_approval_id`. Погашение исторического
+долга допускает inactive customer role и archived counterparty, но не создаёт
+новую commercial activity. Controlled sale reversal сохраняет historical
+customer snapshot после завершения customer role или архивирования party,
+если original sale, organization и customer совпадают; ordinary sale и прямой
+INSERT этого исключения не получают.
+
+Return использует debt-first contract. Initial debt каждой sale line
+пропорционален `sale.debt_amount * line_total / sale.total`; округление идёт до
+четырёх знаков, deterministic final line получает remainder. Возврат сначала
+создаёт signed return allocation и уменьшает receivable, а cash/card/transfer
+refund равен только остатку. Reversal создаёт exact negative allocation и
+восстанавливает projection и line capacity. Sale reversal с любым active
+ordinary return сохраняет `V2_SALE_REVERSAL_RETURN_EXISTS`, а active
+collection/write-off или другой debt allocation блокируется
+`V2_SALE_REVERSAL_DEBT_ACTIVITY_EXISTS`; pristine debt закрывается allocation с
+source `sale_reversal_id` и exact opposite settlement entry.
+
+Payment graph проверяет exact source: refund связан с confirmed payment именно
+original sale, return reversal — с payment original return, debt-payment
+reversal — с payment original debt header; method, currency и exact opposite
+amount также совпадают. Cross-sale/cross-branch substitution отклоняется
+`V2_PAYMENT_SOURCE_GRAPH_MISMATCH`. Debt payment reversal проводится в текущей open shift и не меняет historical
+shift; write-off и его reversal требуют отдельные approvals. Все изменения
+projection выводятся из signed append-only allocations. Purchase posting пишет
+отрицательную settlement entry, reversal — точную положительную opposite row.
+Purchase settlement получает command ID только из function-owned transaction
+context фактического post/reversal command; поиск по
+`organization_id + local_operation_id + limit 1` не используется.
+Supplier payment откладывается до 0016; goods-taken document исключён из Core
+Pilot 0015, хотя ledger type зарезервирован как extension point.
+
+Все writers и period close используют один `v2_lock_settlement_scope` для
+organization/counterparty/currency до финансового read/mutation. Это
+сериализует close с новыми entries, credit sales, payment/return/write-off и их
+reversal. Settlement periods всегда scoped по currency и не прикрепляют entries через
+mutable FK. Close под тем же lock создаёт immutable ordered act lines и canonical snapshot hash;
+late correction допускается только новым более поздним correction period.
+`v2_settlement_journal` является filtered journal: он применяет
+debts/settlements permissions, branch scope и exact support grants и может
+скрывать purchase entries без `purchases.cost.view`; он не используется для
+authoritative total. `v2_counterparty_balance`, periods, acts и act lines
+доступны только при full-scope visibility, включая `purchases.cost.view` для
+каждой branch с purchase entries; иначе balance выдаёт
+`V2_SETTLEMENT_FULL_VISIBILITY_REQUIRED`, а snapshot полностью скрыт. Source
+guards дополнительно сверяют organization, branch, party, currency, sign,
+exact reversal document, command и period range/amount snapshot. Semantic
+outbox/audit events коррелируются exact command ID и
+не содержат private contacts, tax IDs, notes, provider references или approval
+reason. Debt workflows выпускают `DebtOpened`, `DebtPaymentRecorded`,
+`DebtPartiallyRepaid`/`DebtClosed`, `DebtPaymentReversed`, `DebtReopened`,
+`DebtReducedByReturn`, `DebtRestoredByReturnReversal`, `DebtWrittenOff`,
+`DebtWriteOffReversed`, `ReceivableReversed`, `SettlementEntryPosted` и
+`SettlementEntryReversed`; close выпускает `SettlementPeriodClosed` и
+`SettlementActCreated`. `DebtReopened` создаётся только при реальном переходе
+terminal → open/partial. Exact replay возвращает прежний entity ID и не
+дублирует financial rows, inventory/payment graph или semantic events;
+изменённый payload отклоняется stable idempotency error.
+
 ### Реализованный контракт migration 0014
 
 В период coexistence концептуальные Sales, Payments и Shifts физически
@@ -2262,7 +2350,7 @@ issued требует receipt, failed — error code, deferred запрещае�
 | `0012_v2_counterparties.sql` | parties/roles/contacts/addresses/credit | supplier/customer untouched | 0008 | Duplicate candidates/exceptions |
 | `0013_v2_purchases_inventory.sql` | purchase/inventory documents, warehouse transfers, physical `product_batches_v2`, ledgers/balances | Legacy `product_batches`/`stock_movements` and their FK remain untouched; no backfill/dual-write | 0010–0012 | Synthetic doc rehearsal; stock reconciliation |
 | `0014_v2_sales_payments.sql` | physical `sales_v2`, lines/allocations, returns, held sales, `payments_v2`, minimal `shifts_v2`/totals, fiscal intents/attempts | V1 sales/payments/shifts retained; no backfill or dual-write | 0011,0013 | Fully-paid totals, FEFO, signed payments, fiscal intent, raw-cost RLS |
-| `0015_v2_debts_settlements.sql` | receivables/allocations/settlement tables | V1 debts retained | 0012,0014 | Debt and party ledger reconciliation |
+| `0015_v2_debts_settlements.sql` | receivables, physical `debt_payments_v2`, signed allocations, settlement ledger/periods/immutable act snapshots | legacy `debt_payments` untouched; no backfill/dual-write | 0012,0014 | Debt and party ledger reconciliation by signed allocations/entries |
 | `0016_v2_shifts_cash.sql` | cash movements, manual cash in/out, denominations/counting, discrepancy approvals and operational cash reports | V1 shifts retained; minimal V2 shifts already in 0014 | 0014 | Cash-ledger reconciliation and discrepancy controls |
 | `0017_v2_sync_audit_outbox.sql` | sync commands, final event plumbing | sync_operations retained | all domain commands stable | Retry/idempotency/outbox tests |
 | `0018_v2_rls.sql` | RLS helpers, policies, grants, defensive triggers | Revoke unsafe V2 grants only | tables/backfill helpers | Role matrix and cross-tenant test suite |

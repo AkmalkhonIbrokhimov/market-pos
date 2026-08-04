@@ -30,9 +30,9 @@ select is(i.column_default is not null,e.has_default,e.table_name||'.'||e.column
 
 -- Coexistence, permissions, templates and inventory source extension.
 select has_table('public',t,'legacy '||t||' remains')from(values('sales'),('sale_items'),('payments'),('shifts'))x(t);
-select is((select count(*)from permissions),48::bigint,'permission registry 48');
-select is((select count(*)from permissions where critical),6::bigint,'critical registry remains six');
-select is((select count(*)from permission_profile_permissions where permission_profile_id='00000000-0000-0000-0000-000000000101'),48::bigint,'owner template 48');
+select is((select count(*)from permissions),51::bigint,'permission registry 51');
+select is((select count(*)from permissions where critical),9::bigint,'critical registry nine');
+select is((select count(*)from permission_profile_permissions where permission_profile_id='00000000-0000-0000-0000-000000000101'),51::bigint,'owner template 51');
 select is((select count(*)from permission_profile_permissions where permission_profile_id='00000000-0000-0000-0000-000000000102'),16::bigint,'seller template 16');
 select ok(exists(select 1 from permissions where code='sales.cost.view'and module='sales'and not critical),'sales.cost.view registered');
 select ok(exists(select 1 from permission_profile_permissions ppp join permissions p on p.id=ppp.permission_id where ppp.permission_profile_id='00000000-0000-0000-0000-000000000101'and p.code='sales.cost.view'),'owner receives cost permission');
@@ -331,7 +331,7 @@ select ok(not has_function_privilege('authenticated',format('public.%I(%s)',f,ar
 select ok(has_function_privilege('authenticated',format('public.%I(%s)',f,args),'EXECUTE'),'safe authenticated helper granted: '||f)from(values
  ('v2_can_view_shift','uuid,uuid,uuid'),('v2_fiscal_status_for_sale','uuid'),('v2_fiscal_status_for_return','uuid'))x(f,args);
 select ok(position(lower(required_fragment)in lower(pg_get_functiondef(p.oid)))>0,f||' contains required contract: '||required_fragment)from(values
- ('v2_require_open_sales_shift','FOR UPDATE'),('v2_require_open_sales_shift','V2_SHIFT_DEVICE_SCOPE_MISMATCH'),('v2_require_open_sales_shift','V2_SHIFT_NOT_OWNED'),('v2_reverse_sale','v2_lock_inventory_scopes'),('v2_reverse_sale_return','v2_lock_inventory_scopes'),('v2_reverse_sale','reversal_of_id'),('v2_reverse_sale_return','PaymentAccepted'),('v2_complete_fiscal_attempt','completion_hash'),('v2_complete_fiscal_attempt','V2_FISCAL_COMPLETION_PAYLOAD_MISMATCH'),('v2_complete_fiscal_attempt','external_receipt_id'),('v2_recompute_sale_return_status','reversal_of_id is null'),('v2_can_view_shift','opened_by'))x(f,required_fragment)join pg_proc p on p.proname=f and p.pronamespace='public'::regnamespace;
+ ('v2_require_open_sales_shift','FOR UPDATE'),('v2_require_open_sales_shift','V2_SHIFT_DEVICE_SCOPE_MISMATCH'),('v2_require_open_sales_shift','V2_SHIFT_NOT_OWNED'),('v2_reverse_sale','v2_lock_inventory_scopes'),('v2_reverse_sale_return_0014','v2_lock_inventory_scopes'),('v2_reverse_sale','reversal_of_id'),('v2_reverse_sale_return_0014','PaymentAccepted'),('v2_complete_fiscal_attempt','completion_hash'),('v2_complete_fiscal_attempt','V2_FISCAL_COMPLETION_PAYLOAD_MISMATCH'),('v2_complete_fiscal_attempt','external_receipt_id'),('v2_recompute_sale_return_status','reversal_of_id is null'),('v2_can_view_shift','opened_by'))x(f,required_fragment)join pg_proc p on p.proname=f and p.pronamespace='public'::regnamespace;
 select ok(position(fragment in pg_get_triggerdef(t.oid))>0,tr||' protects lifecycle')from(values
  ('v2_sale_lines_append_only','v2_sale_line_immutable'),('v2_sale_allocations_append_only','v2_strict_financial_immutable'),('v2_payments_append_only','v2_strict_financial_immutable'),('v2_return_lines_append_only','v2_strict_financial_immutable'),('v2_returns_lifecycle','v2_sale_return_guard'),('v2_fiscal_documents_write','v2_fiscal_document_write_guard'),('v2_fiscal_attempts_write','v2_fiscal_attempt_write_guard'))x(tr,fragment)join pg_trigger t on t.tgname=tr and not t.tgisinternal;
 select ok(position(fragment in pg_get_expr(p.polqual,p.polrelid))>0,policy||' enforces helper')from(values('shifts_v2_select','v2_can_view_shift'),('shift_totals_select','v2_can_view_shift'),('fiscal_documents_select','v2_has_support_grant'))x(policy,fragment)join pg_policy p on p.polname=policy;
