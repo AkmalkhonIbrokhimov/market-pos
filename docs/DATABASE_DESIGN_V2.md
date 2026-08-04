@@ -2279,12 +2279,22 @@ Registry после migration содержит 53 permissions, 10 critical, owne
 53 и seller template 16. Новые permissions: noncritical `cash.view` и critical
 `settlements.reverse`; обе входят только в owner system template.
 
-`v2_lock_register_shift_scope(organization,branch,register)` использует
-transaction-scoped advisory lock. Единый порядок: command/idempotency, approval,
-register advisory lock, shift row, device/source, settlement advisory lock,
-financial ledgers, totals, audit/outbox. Ни один cash-aware wrapper не получает
-settlement lock раньше register lock; повторный lock внутри base function
-reentrant в той же transaction.
+`v2_lock_operation_scope(organization,device,local_operation)` первым получает
+transaction-scoped advisory lock с отдельным `market-pos-operation:` prefix.
+Lock использует тот же logical idempotency scope, что unique command identity, и
+сериализует reuse operation ID между разными command types до command/register
+locks. Фактический порядок: operation advisory lock → command/approval row →
+register advisory lock → shift row и device/source → settlement advisory lock →
+financial ledgers → shift totals → audit/outbox. Ни один cash-aware wrapper не
+получает settlement lock раньше register lock.
+
+Outer wrappers над financial base-функциями 0015 сначала получают operation,
+register и при необходимости settlement locks, затем вызывают
+`*_0015_cash_base`. Поэтому command row внутри base может физически создаваться
+после register lock: idempotency identity уже сериализована outer operation
+lock, command/register inversion устранена, а повторные register/settlement
+locks reentrant в той же transaction. Payload hashing и command row при этом не
+дублируются.
 Единый helper вызывают open/close, sale/return/reversal, debt
 payment/reversal, manual cash и supplier payment/reversal writers. Это
 сериализует payment writer с close и не оставляет externally committed

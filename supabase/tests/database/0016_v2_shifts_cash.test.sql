@@ -1,7 +1,7 @@
 begin;
 create extension if not exists pgtap with schema extensions;
 set search_path=public,extensions;
-select plan(551);
+select plan(576);
 
 -- Additive physical scope and legacy coexistence.
 select has_table('public',t,t||' exists')from(values('cash_movements'),('shift_cash_counts'),('supplier_payments'))x(t);
@@ -89,7 +89,7 @@ select ok(to_regprocedure(sig)is not null,sig||' exists')from(values
  ('public.v2_record_supplier_payment(uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamp with time zone,jsonb)'),('public.v2_reverse_supplier_payment(uuid,uuid,text,uuid,uuid,uuid,jsonb)'),
  ('public.v2_close_shift(uuid,uuid,numeric,uuid)'),('public.v2_close_shift(uuid,uuid,jsonb,jsonb,uuid,uuid)'),
  ('public.v2_cash_journal(uuid,uuid,uuid)'),('public.v2_shift_reconciliation(uuid)'),('public.v2_supplier_payment_journal(uuid,uuid,uuid)'),('public.v2_supplier_payment_journal(uuid,uuid,uuid,character)'),
- ('public.v2_lock_register_shift_scope(uuid,uuid,uuid)'),('public.v2_cash_context_required()'),('public.v2_cash_append_only()'),('public.v2_supplier_payment_context_required()'),
+ ('public.v2_lock_operation_scope(uuid,uuid,uuid)'),('public.v2_lock_register_shift_scope(uuid,uuid,uuid)'),('public.v2_cash_context_required()'),('public.v2_cash_append_only()'),('public.v2_supplier_payment_context_required()'),
  ('public.v2_guard_cash_movement()'),('public.v2_guard_shift_cash_count()'),('public.v2_guard_supplier_payment()'),('public.v2_guard_supplier_settlement_entry()'),
  ('public.v2_recompute_shift_payment_totals(uuid)'),('public.v2_expected_physical_cash(uuid)'),('public.v2_require_cash_drawer_capacity(uuid,numeric)'),('public.v2_validate_payment_cash_graph(uuid)'),('public.v2_cash_count_total(uuid,uuid)'),('public.v2_validate_shift_close_snapshot(uuid,uuid)'),('public.v2_append_cash_movement_for_payment(uuid,uuid)'),('public.v2_require_open_sales_shift(uuid,uuid,uuid,uuid,uuid,uuid)'))x(sig);
 select ok(has_function_privilege('authenticated',sig,'EXECUTE'),'authenticated executes '||sig)from(values
@@ -98,11 +98,11 @@ select ok(has_function_privilege('authenticated',sig,'EXECUTE'),'authenticated e
  ('public.v2_record_supplier_payment(uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamp with time zone,jsonb)'),('public.v2_reverse_supplier_payment(uuid,uuid,text,uuid,uuid,uuid,jsonb)'),
  ('public.v2_close_shift(uuid,uuid,numeric,uuid)'),('public.v2_close_shift(uuid,uuid,jsonb,jsonb,uuid,uuid)'),('public.v2_cash_journal(uuid,uuid,uuid)'),('public.v2_shift_reconciliation(uuid)'),('public.v2_supplier_payment_journal(uuid,uuid,uuid)'),('public.v2_supplier_payment_journal(uuid,uuid,uuid,character)'))x(sig);
 select ok(not has_function_privilege(role_name,sig,'EXECUTE'),role_name||' denied internal '||sig)from(values('public'),('anon'),('authenticated'))r(role_name)cross join(values
- ('public.v2_lock_register_shift_scope(uuid,uuid,uuid)'),('public.v2_cash_context_required()'),('public.v2_cash_append_only()'),('public.v2_supplier_payment_context_required()'),('public.v2_guard_cash_movement()'),('public.v2_guard_shift_cash_count()'),('public.v2_guard_supplier_payment()'),('public.v2_guard_supplier_settlement_entry()'),('public.v2_recompute_shift_payment_totals(uuid)'),('public.v2_expected_physical_cash(uuid)'),('public.v2_require_cash_drawer_capacity(uuid,numeric)'),('public.v2_validate_payment_cash_graph(uuid)'),('public.v2_cash_count_total(uuid,uuid)'),('public.v2_validate_shift_close_snapshot(uuid,uuid)'),('public.v2_append_cash_movement_for_payment(uuid,uuid)'),('public.v2_require_open_sales_shift(uuid,uuid,uuid,uuid,uuid,uuid)'))f(sig);
+ ('public.v2_lock_operation_scope(uuid,uuid,uuid)'),('public.v2_lock_register_shift_scope(uuid,uuid,uuid)'),('public.v2_cash_context_required()'),('public.v2_cash_append_only()'),('public.v2_supplier_payment_context_required()'),('public.v2_guard_cash_movement()'),('public.v2_guard_shift_cash_count()'),('public.v2_guard_supplier_payment()'),('public.v2_guard_supplier_settlement_entry()'),('public.v2_recompute_shift_payment_totals(uuid)'),('public.v2_expected_physical_cash(uuid)'),('public.v2_require_cash_drawer_capacity(uuid,numeric)'),('public.v2_validate_payment_cash_graph(uuid)'),('public.v2_cash_count_total(uuid,uuid)'),('public.v2_validate_shift_close_snapshot(uuid,uuid)'),('public.v2_append_cash_movement_for_payment(uuid,uuid)'),('public.v2_require_open_sales_shift(uuid,uuid,uuid,uuid,uuid,uuid)'))f(sig);
 
 -- Distinct definition-level contracts (single-session concurrency evidence included).
 select ok(position(lower(needle)in lower(pg_get_functiondef(sig::regprocedure)))>0,description)from(values
- ('public.v2_lock_register_shift_scope(uuid,uuid,uuid)','pg_advisory_xact_lock','register scope uses transaction advisory lock'),('public.v2_lock_register_shift_scope(uuid,uuid,uuid)','V2_REGISTER_SHIFT_SCOPE_MISMATCH','lock validates exact register scope'),
+ ('public.v2_lock_operation_scope(uuid,uuid,uuid)','market-pos-operation:','operation lock uses isolated deterministic prefix'),('public.v2_lock_operation_scope(uuid,uuid,uuid)','V2_OPERATION_SCOPE_REQUIRED','operation lock rejects null identity'),('public.v2_lock_register_shift_scope(uuid,uuid,uuid)','pg_advisory_xact_lock','register scope uses transaction advisory lock'),('public.v2_lock_register_shift_scope(uuid,uuid,uuid)','V2_REGISTER_SHIFT_SCOPE_MISMATCH','lock validates exact register scope'),
  ('public.v2_open_shift(uuid,uuid,uuid,uuid,numeric,character,date,uuid)','v2_lock_register_shift_scope','canonical open takes central lock'),('public.v2_open_shift(uuid,uuid,uuid,uuid,numeric,character,date,uuid)','V2_SHIFT_ALREADY_OPEN','canonical open has stable contention error'),('public.v2_open_shift(uuid,uuid,uuid,uuid,numeric,character,date,uuid)','OpeningCashRecorded','open emits opening event'),('public.v2_open_shift(uuid,uuid,uuid,uuid,numeric,character,date,uuid)','shift_totals','open creates three totals'),
  ('public.v2_record_cash_movement(uuid,uuid,text,numeric,character,date,text,uuid,uuid)','v2_lock_register_shift_scope','manual writer takes central lock'),('public.v2_record_cash_movement(uuid,uuid,text,numeric,character,date,text,uuid,uuid)','cash.move.override','correction requires override'),('public.v2_record_cash_movement(uuid,uuid,text,numeric,character,date,text,uuid,uuid)','V2_CASH_MOVEMENT_INPUT_INVALID','manual input error stable'),('public.v2_record_cash_movement(uuid,uuid,text,numeric,character,date,text,uuid,uuid)','CashMovementPosted','manual command emits event'),
  ('public.v2_reverse_cash_movement(uuid,uuid,uuid,uuid,uuid,jsonb)','v2_lock_register_shift_scope','manual reversal takes central lock'),('public.v2_reverse_cash_movement(uuid,uuid,uuid,uuid,uuid,jsonb)','V2_CASH_MANUAL_REVERSAL_FORBIDDEN','only manual movements reverse here'),('public.v2_reverse_cash_movement(uuid,uuid,uuid,uuid,uuid,jsonb)','CashMovementReversed','manual reversal emits event'),
@@ -121,6 +121,27 @@ select ok(position('v2_lock_register_shift_scope'in pg_get_functiondef(sig::regp
  ('public.v2_reverse_sale(uuid,uuid,text,uuid,uuid,uuid,jsonb)','sale reversal register lock precedes settlement lock'),
  ('public.v2_record_debt_payment(uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamp with time zone,jsonb,jsonb)','debt payment register lock precedes settlement lock'),
  ('public.v2_reverse_debt_payment(uuid,uuid,text,uuid,uuid,uuid,jsonb)','debt reversal register lock precedes settlement lock'))x(sig,description);
+
+select ok(
+ position('v2_lock_operation_scope'in pg_get_functiondef(sig::regprocedure))<position(command_fragment in pg_get_functiondef(sig::regprocedure))
+ and position(command_fragment in pg_get_functiondef(sig::regprocedure))<position('v2_lock_register_shift_scope'in pg_get_functiondef(sig::regprocedure)),description)from(values
+ ('public.v2_open_shift(uuid,uuid,uuid,uuid,numeric,character,date,uuid)','v2_begin_inventory_command','open operation lock precedes command and register'),
+ ('public.v2_record_cash_movement(uuid,uuid,text,numeric,character,date,text,uuid,uuid)','v2_use_approved_command','manual operation lock precedes command and register'),
+ ('public.v2_reverse_cash_movement(uuid,uuid,uuid,uuid,uuid,jsonb)','v2_use_approved_command','manual reversal operation lock precedes approval and register'),
+ ('public.v2_record_supplier_payment(uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamp with time zone,jsonb)','v2_begin_inventory_command','supplier operation lock precedes command and register'),
+ ('public.v2_reverse_supplier_payment(uuid,uuid,text,uuid,uuid,uuid,jsonb)','v2_use_approved_command','supplier reversal operation lock precedes approval and register'),
+ ('public.v2_close_shift(uuid,uuid,jsonb,jsonb,uuid,uuid)','v2_begin_inventory_command','close operation lock precedes command and register'))x(sig,command_fragment,description);
+
+select ok(
+ position('v2_lock_operation_scope'in pg_get_functiondef(sig::regprocedure))<position('v2_lock_register_shift_scope'in pg_get_functiondef(sig::regprocedure))
+ and position('v2_lock_register_shift_scope'in pg_get_functiondef(sig::regprocedure))<position('v2_lock_settlement_scope'in pg_get_functiondef(sig::regprocedure))
+ and position('v2_lock_settlement_scope'in pg_get_functiondef(sig::regprocedure))<position(base_fragment in pg_get_functiondef(sig::regprocedure)),description)from(values
+ ('public.v2_post_sale(uuid,uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamp with time zone,jsonb,jsonb,uuid,jsonb)','v2_post_sale_0015_cash_base','sale wrapper lock order exact'),
+ ('public.v2_post_sale_return(uuid,uuid,text,uuid,uuid,jsonb,jsonb)','v2_post_sale_return_0015_cash_base','return wrapper lock order exact'),
+ ('public.v2_reverse_sale_return(uuid,uuid,text,uuid,uuid,uuid,jsonb)','v2_reverse_sale_return_0015_cash_base','return reversal wrapper lock order exact'),
+ ('public.v2_reverse_sale(uuid,uuid,text,uuid,uuid,uuid,jsonb)','v2_reverse_sale_0015_cash_base','sale reversal wrapper lock order exact'),
+ ('public.v2_record_debt_payment(uuid,uuid,uuid,uuid,uuid,text,date,character,uuid,uuid,timestamp with time zone,jsonb,jsonb)','v2_record_debt_payment_0015_cash_base','debt payment wrapper lock order exact'),
+ ('public.v2_reverse_debt_payment(uuid,uuid,text,uuid,uuid,uuid,jsonb)','v2_reverse_debt_payment_0015_cash_base','debt reversal wrapper lock order exact'))x(sig,base_fragment,description);
 
 -- Behavioral owner fixture: canonical open, manual ledger, replay and close.
 insert into auth.users(instance_id,id,aud,role,email,encrypted_password,email_confirmed_at,created_at,updated_at)values
@@ -210,6 +231,15 @@ select is((select sum(amount)from payments_v2 where supplier_payment_id=(select 
 select is((select amount_delta from cash_movements where source_id=(select id from payments_v2 where supplier_payment_id=(select id from supplier_payments where document_number='SP16-1')and method='cash')),-30.0000::numeric,'supplier cash movement signed negative');
 select is((select amount_delta from settlement_entries where source_document_type='supplier_payment'and source_document_id=(select id from supplier_payments where document_number='SP16-1')),50.0000::numeric,'supplier settlement reduces liability');
 select is((select count(*)from supplier_payments where document_number='SP16-1'),1::bigint,'supplier replay no duplicate');
+set local role authenticated;
+select throws_ok($$select v2_record_supplier_payment('00000000-0000-0000-0000-000000016101','00000000-0000-0000-0000-000000016401','00000000-0000-0000-0000-000000016601',(select id from shifts_v2 where register_id='00000000-0000-0000-0000-000000016601'),'00000000-0000-0000-0000-000000016901','SP16-COLLISION',current_date,'UZS','00000000-0000-0000-0000-000000016701','00000000-0000-0000-0000-000000016811',now(),jsonb_build_array(jsonb_build_object('method','card','amount',-1)))$$,'P0001','V2_IDEMPOTENCY_COMMAND_TYPE_MISMATCH','same operation identity cannot change command type');
+reset role;
+select is((select count(*)from command_log where organization_id='00000000-0000-0000-0000-000000016101'and device_id='00000000-0000-0000-0000-000000016701'and local_operation_id='00000000-0000-0000-0000-000000016811'),1::bigint,'command-type collision creates no second command');
+select is((select count(*)from supplier_payments where document_number='SP16-COLLISION'),0::bigint,'command-type collision creates no supplier document');
+select is((select count(*)from payments_v2 where supplier_payment_id in(select id from supplier_payments where document_number='SP16-COLLISION')),0::bigint,'command-type collision creates no payment');
+select is((select count(*)from settlement_entries where source_document_type='supplier_payment'and source_document_id in(select id from supplier_payments where document_number='SP16-COLLISION')),0::bigint,'command-type collision creates no settlement entry');
+select is((select count(*)from audit_events where entity_type='supplier_payment'and local_operation_id='00000000-0000-0000-0000-000000016811'),0::bigint,'command-type collision creates no supplier audit event');
+select is((select count(*)from outbox_events where aggregate_type='supplier_payment'and correlation_id=(select id from command_log where organization_id='00000000-0000-0000-0000-000000016101'and device_id='00000000-0000-0000-0000-000000016701'and local_operation_id='00000000-0000-0000-0000-000000016811')),0::bigint,'command-type collision creates no supplier outbox event');
 select set_config('market_pos.counterparty_command','on',true);update counterparty_roles set ended_at=now()where id='00000000-0000-0000-0000-000000016902';update counterparties set status='archived',archived_at=now()where id='00000000-0000-0000-0000-000000016901';select set_config('market_pos.counterparty_command','off',true);
 set local role authenticated;
 select lives_ok($$select v2_record_supplier_payment('00000000-0000-0000-0000-000000016101','00000000-0000-0000-0000-000000016401','00000000-0000-0000-0000-000000016601',(select id from shifts_v2 where register_id='00000000-0000-0000-0000-000000016601'),'00000000-0000-0000-0000-000000016901','SP16-HIST',current_date,'UZS','00000000-0000-0000-0000-000000016701','00000000-0000-0000-0000-000000016917',now(),jsonb_build_array(jsonb_build_object('method','card','amount',-20)))$$,'historical archived supplier with payable remains payable');
