@@ -1525,9 +1525,9 @@ erDiagram
 
 ## 56. Кассовые смены
 
-### `shifts`
+### `shifts_v2`
 
-**Контракт:** Shifts; register session. RLS branch seller own/owner; open/close RPC only; open status permits limited updates, closed immutable/delete forbidden; outbox `ShiftOpened/Closed`; offline active shift snapshot.
+**Контракт:** Shifts; физическая V2 register session во время coexistence. RLS branch seller own/owner; open/close RPC only; переход `open → closing → closed` выполняется в одной transaction, closed row полностью immutable/delete forbidden; outbox `ShiftOpened/ShiftClosed`; offline active shift snapshot. Legacy `public.shifts` не изменяется и не получает dual-write/backfill.
 
 | Поле | PostgreSQL type | Null | Default | Назначение |
 | --- | --- | --- | --- | --- |
@@ -1537,15 +1537,21 @@ erDiagram
 | register_id | uuid | нет | — | Register |
 | opened_by | uuid | нет | — | Membership |
 | opening_cash_amount | numeric(18,4) | нет | `0` | Opening |
+| business_date | date | логически нет для новых rows | — | Branch-local business date |
+| currency_code | char(3) | логически нет для новых rows | — | ISO currency |
 | status | text | нет | `'open'` | open/closing/closed |
 | opened_at | timestamptz | нет | now() | Open |
 | closed_by | uuid | да | — | Actor |
 | closed_at | timestamptz | да | — | Close |
 | actual_cash_amount | numeric(18,4) | да | — | Count |
+| expected_cash_amount | numeric(18,4) | да | — | Signed physical cash ledger sum at close |
 | difference_amount | numeric(18,4) | да | — | Difference |
+| open_command_id | uuid | логически нет для новых rows | — | Exact open command |
+| close_command_id | uuid | да | — | Exact close command |
+| close_approval_id | uuid | да | — | Exact discrepancy approval |
 | version | bigint | нет | `1` | Lock |
 
-Partial unique one open shift per register Core Pilot. Closed status requires close fields. Index branch/date.
+Historical rows получают currency/business date только из доказуемых organization settings, а open command — только при однозначной exact correlation; иначе nullable compatibility сохраняется без ложных данных. Guard применяет обязательный contract ко всем новым command-created shifts. Partial unique допускает только одну open/closing shift на register.
 
 ### `shift_totals`
 
@@ -1562,32 +1568,45 @@ Partial unique one open shift per register Core Pilot. Closed status requires cl
 | version | bigint | нет | `0` | Projection |
 | updated_at | timestamptz | нет | now() | Updated |
 
-Unique shift/method. Reconciliation sums payments and cash movements.
+Unique shift/method. Authoritative equation: `expected_amount[method] = sum(confirmed payments_v2.amount)`; opening/manual cash movements projection не меняют. При close cash `actual_amount` равен physical count минус opening и все manual/correction deltas; card/transfer actual totals передаются canonical close payload.
 
 ## 57. Кассовые движения
 
 ### `cash_movements`
 
-**Контракт:** Payments/Shifts append-only cash ledger. FK shift/register/source/reversal; RLS own shift/owner; insert `record_cash_movement` and payment commands; update/delete forbidden; reversal opposite; outbox `CashMovementPosted`; offline queue.
+**Контракт:** Payments/Shifts append-only signed physical cash ledger. FK organization/branch/register/shift/device/command/approval/actor/reversal; INSERT только command helpers, UPDATE/DELETE всегда запрещены. Payment-derived cash row создаётся сразу после exact `payments_v2` INSERT, card/transfer возвращают `NULL`; ручные движения идут через `v2_record_cash_movement`, reversal — exact opposite append-only row. Outbox: `OpeningCashRecorded`, `CashMovementPosted`, `CashMovementReversed`.
 
 | Поле | PostgreSQL type | Null | Default | Назначение |
 | --- | --- | --- | --- | --- |
 | id | uuid | нет | gen_random_uuid() | Movement |
 | organization_id | uuid | нет | — | Tenant |
+| branch_id | uuid | нет | — | Branch |
 | register_id | uuid | нет | — | Register |
 | shift_id | uuid | нет | — | Shift |
-| movement_type | text | нет | — | sale/in/out/refund/debt_payment |
+| movement_type | text | нет | — | opening/sale/refund/debt_payment/supplier_payment/cash_in/cash_out/correction |
 | amount_delta | numeric(18,4) | нет | — | Signed cash |
+| currency_code | char(3) | нет | — | Shift currency |
+| business_date | date | нет | — | Shift business date |
 | source_type | text | нет | — | Source |
 | source_id | uuid | нет | — | Document |
 | reason | text | да | — | Required manual in/out |
 | device_id | uuid | нет | — | Device |
 | local_operation_id | uuid | нет | — | Idempotency |
 | reversal_of_id | uuid | да | — | Original |
+| command_id | uuid | нет | — | Exact command |
+| approval_request_id | uuid | да | — | Exact critical approval |
 | created_by | uuid | нет | — | Actor |
 | created_at | timestamptz | нет | now() | Time |
 
-Amount nonzero; reason required manual movement. Unique local operation and source role.
+Opening допускает zero и уникален на shift; остальные deltas nonzero. Payment source уникален, а reversal chain допускает только одного непосредственного successor на row. Manual cash-in положителен, cash-out отрицателен, correction signed; reason обязателен только manual. Tenant/location/device/currency/business-date должны точно совпадать с shift. Register advisory lock сериализует open/close и всех финансовых writers.
+
+### `shift_cash_counts`
+
+Immutable denomination snapshot canonical close. Каждая строка хранит positive denomination, nonnegative quantity и exact `counted_amount = denomination_value × quantity`; currency/location/command совпадают с closing shift. Уникальны `(shift_id,line_number)` и `(shift_id,denomination_value)`. Непустой payload и сумма строк, равная physical cash actual, проверяются до commit. Denominations не hardcoded.
+
+### `supplier_payments`
+
+Unallocated supplier settlement payment; он не заявляет оплату конкретной purchase и не создаёт advance. Header и signed `payments_v2` rows находятся в current open shift, exact settlement entry имеет положительный delta и уменьшает отрицательную liability. Текущий authoritative balance обязан быть `< 0`, а total не превышает его absolute value; иначе `V2_SUPPLIER_PAYMENT_EXCEEDS_PAYABLE`. Historical inactive/ended supplier role или archived party допускаются при реальном отрицательном balance. Reversal требует critical `settlements.reverse`, exact approval, создаёт новый header/current-shift opposite payments/cash и отрицательную settlement reversal entry; historical shift не меняется.
 
 ## 58. Фискальные чеки
 
@@ -2250,6 +2269,110 @@ terminal → open/partial. Exact replay возвращает прежний enti
 дублирует financial rows, inventory/payment graph или semantic events;
 изменённый payload отклоняется stable idempotency error.
 
+### Реализованный контракт migration 0016
+
+Migration 0016 добавляет `public.cash_movements`, `public.shift_cash_counts` и
+`public.supplier_payments`, расширяет `shifts_v2` operational close snapshot и
+добавляет `payments_v2.supplier_payment_id`. Legacy `shifts`, `payments` и
+`debt_payments` остаются неизменными; backfill и dual-write отсутствуют.
+Registry после migration содержит 53 permissions, 10 critical, owner template
+53 и seller template 16. Новые permissions: noncritical `cash.view` и critical
+`settlements.reverse`; обе входят только в owner system template.
+
+`v2_lock_operation_scope(organization,device,local_operation)` первым получает
+transaction-scoped advisory lock с отдельным `market-pos-operation:` prefix.
+Lock использует тот же logical idempotency scope, что unique command identity, и
+сериализует reuse operation ID между разными command types до command/register
+locks. Фактический порядок: operation advisory lock → command/approval row →
+register advisory lock → shift row и device/source → settlement advisory lock →
+financial ledgers → shift totals → audit/outbox. Ни один cash-aware wrapper не
+получает settlement lock раньше register lock.
+
+Outer wrappers над financial base-функциями 0015 сначала получают operation,
+register и при необходимости settlement locks, затем вызывают
+`*_0015_cash_base`. Поэтому command row внутри base может физически создаваться
+после register lock: idempotency identity уже сериализована outer operation
+lock, command/register inversion устранена, а повторные register/settlement
+locks reentrant в той же transaction. Payload hashing и command row при этом не
+дублируются.
+Единый helper вызывают open/close, sale/return/reversal, debt
+payment/reversal, manual cash и supplier payment/reversal writers. Это
+сериализует payment writer с close и не оставляет externally committed
+`closing`: ошибка откатывает всю transaction до `open`.
+
+Canonical open принимает currency и business date; compatibility overload
+выводит их server-side из organization settings/timezone. Atomic graph состоит
+из command, shift, трёх zero totals, одного opening movement (включая zero),
+`ShiftOpened` и `OpeningCashRecorded`. Exact replay возвращает прежний shift,
+а второй operation на том же register получает `V2_SHIFT_ALREADY_OPEN`.
+
+Cash ledger является signed physical source of truth. Exact helper
+`v2_append_cash_movement_for_payment(payment_id,command_id)` создаёт row только
+для cash: positive sale, negative refund, positive return reversal, negative
+sale reversal, positive debt collection, negative debt reversal, negative
+supplier payment и positive supplier reversal. Источник — exact payment ID;
+unique semantic index гарантирует одну movement для каждого exact payment row.
+Ordinary partial refund является независимой negative `refund` movement без
+`reversal_of_id`; несколько partial refunds разрешены payment capacity guard.
+Только reversal конкретного refund создаёт positive `refund` с exact ссылкой на
+его movement. Sale/debt/supplier reversals также ссылаются непосредственно на
+exact source movement; alternating reversal chain отсутствует.
+Manual `cash_in`, `cash_out` и signed `correction` требуют непустой reason;
+correction и любое manual reversal используют exact `cash.move.override`
+approval. Primary signs не применяются к reversal: cash-in reversal отрицателен,
+cash-out reversal положителен, correction reversal всегда exact opposite.
+`v2_require_cash_drawer_capacity` последовательно проверяет каждую отрицательную
+проводку; ожидаемый physical cash не может стать отрицательным, иначе
+`V2_CASH_INSUFFICIENT_DRAWER`. Reasons, contacts, approval reason, fingerprints, tokens и hashes не
+попадают в semantic event payload.
+
+Opening movement имеет exact graph: source/shift, opening amount, open command,
+operation, device и actor совпадают с созданной shift; opening нельзя reverse.
+Manual correction/reversal guard требует approved, unexpired
+`cash.move.override` exact command/branch. Supplier reversal требует approved,
+unexpired `settlements.reverse`; status original меняется только после создания
+exact reversal header и settlement reversal с тем же command/approval.
+
+Supplier payment требует не только отрицательный balance, но и фактическую
+active либо ended supplier role history. Archived supplier допустим только с
+ended supplier role; party, никогда не имевшая supplier role, получает
+`V2_SUPPLIER_ROLE_HISTORY_REQUIRED`. Canonical
+`v2_supplier_payment_journal(organization,branch,counterparty,currency)`
+авторизует и возвращает ровно одну currency. Старый three-argument wrapper
+работает только при одной distinct payment currency, иначе требует явную
+currency через `V2_SUPPLIER_PAYMENT_CURRENCY_REQUIRED`.
+
+Canonical close требует exact JSON keys `cash/card/transfer`, nonempty
+denomination array без unknown keys и sum counts = physical cash actual. Он
+блокирует shift и source ledgers, пересчитывает signed confirmed payments,
+проверяет one cash movement per cash payment и отсутствие orphan movements.
+`expected physical cash = sum(cash_movements.amount_delta)` и не может быть
+отрицательным; close выдаёт тот же `V2_CASH_INSUFFICIENT_DRAWER` до snapshot.
+Payment-equivalent
+cash actual равен `physical count − opening − manual cash-in/out − corrections`.
+Tolerance в 0016 равна zero: любое отличие cash/card/transfer требует exact
+`cash.move.override` approval и только тогда выпускает
+`ShiftDiscrepancyDetected`; успешный close фиксирует immutable totals/counts и
+`ShiftClosed`. Compatibility close с одним actual cash разрешён только при
+нулевых card/transfer expected totals, иначе
+`V2_SHIFT_ACTUAL_TOTALS_REQUIRED`.
+
+Close использует только существующий fiscal contract 0014: register с
+`fiscal.mode = required` блокируется при nonterminal fiscal documents/attempts.
+Legacy sync tables и произвольные stale processing commands не являются
+blocker. Проверка pending offline commands намеренно отложена до 0017, когда
+появится authoritative sync queue.
+
+Raw cash tables читают только owner/custom members с `cash.view` и authorized
+branch. Seller не получает raw cash access, но `v2_cash_journal` показывает
+только signed delta/time/type собственной shift. Support имеет только safe RPC
+при exact active `cash.view` grant. `v2_shift_reconciliation` authoritative и
+требует `cash.view`; `v2_supplier_payment_journal` дополнительно применяет
+full settlement/purchase-cost visibility contract 0015. Browser I/U/D
+отсутствуют. Все financial semantic events имеют exact command correlation;
+critical reversal/discrepancy events сохраняют exact approval ID. Exact replay
+не создаёт повторных ledger rows, audit или outbox events.
+
 ### Реализованный контракт migration 0014
 
 В период coexistence концептуальные Sales, Payments и Shifts физически
@@ -2351,7 +2474,7 @@ issued требует receipt, failed — error code, deferred запрещае�
 | `0013_v2_purchases_inventory.sql` | purchase/inventory documents, warehouse transfers, physical `product_batches_v2`, ledgers/balances | Legacy `product_batches`/`stock_movements` and their FK remain untouched; no backfill/dual-write | 0010–0012 | Synthetic doc rehearsal; stock reconciliation |
 | `0014_v2_sales_payments.sql` | physical `sales_v2`, lines/allocations, returns, held sales, `payments_v2`, minimal `shifts_v2`/totals, fiscal intents/attempts | V1 sales/payments/shifts retained; no backfill or dual-write | 0011,0013 | Fully-paid totals, FEFO, signed payments, fiscal intent, raw-cost RLS |
 | `0015_v2_debts_settlements.sql` | receivables, physical `debt_payments_v2`, signed allocations, settlement ledger/periods/immutable act snapshots | legacy `debt_payments` untouched; no backfill/dual-write | 0012,0014 | Debt and party ledger reconciliation by signed allocations/entries |
-| `0016_v2_shifts_cash.sql` | cash movements, manual cash in/out, denominations/counting, discrepancy approvals and operational cash reports | V1 shifts retained; minimal V2 shifts already in 0014 | 0014 | Cash-ledger reconciliation and discrepancy controls |
+| `0016_v2_shifts_cash.sql` | `cash_movements`, `shift_cash_counts`, unallocated `supplier_payments`; canonical shift open/close, safe journals and reconciliation | V1 shifts/payments/debt_payments retained; no backfill/dual-write | 0014–0015 | Register/shift serialization, signed payment-to-cash graph, zero-tolerance discrepancy approval, fiscal blocker; pending sync deferred to 0017 |
 | `0017_v2_sync_audit_outbox.sql` | sync commands, final event plumbing | sync_operations retained | all domain commands stable | Retry/idempotency/outbox tests |
 | `0018_v2_rls.sql` | RLS helpers, policies, grants, defensive triggers | Revoke unsafe V2 grants only | tables/backfill helpers | Role matrix and cross-tenant test suite |
 | `0019_v2_backfill.sql` | idempotent backfill procedures/checkpoints | Reads V1, writes V2 | 0007–0018 | Dry run, exceptions, restartability |
