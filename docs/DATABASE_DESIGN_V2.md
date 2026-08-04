@@ -2178,13 +2178,25 @@ Debt sale вычисляет долг сервером как total минус c
 новым overload `v2_post_sale(..., approval_id, debt_terms)`. Клиент не передаёт
 authoritative debt amount. Пустой payments array означает full debt, а неполная
 сумма confirmed payments — mixed payment/debt. `debt_terms` допускает только
-`due_date`; без неё due date равна `business_date + max_due_days`.
-Credit exposure считается organization-wide по всем branch как сумма открытых
-receivable одной organization/counterparty/currency. Новый долг требует active
+`due_date` и `limit_override_approval_id`; без due date она равна
+`business_date + max_due_days`, а дата раньше `business_date` запрещена
+(`V2_SALE_DEBT_DUE_DATE_INVALID`). Credit exposure считается organization-wide
+по всем branch как сумма открытых receivable одной
+organization/counterparty/currency. Exact settlement scope сначала получает
+transaction advisory lock, затем блокируются counterparty и credit settings,
+и лишь после этого читается exposure. Поэтому две параллельные credit sale не
+могут вместе превысить limit. Новый долг требует active
 customer role и действующих credit settings; превышение limit, disabled credit
 или due date вне terms требует `debts.limit.override` с approved critical
-request. Погашение исторического долга допускает inactive customer role и
-archived counterparty, но не создаёт новую commercial activity.
+request. Если одновременно нужны `sales.discount.override` и
+`debts.limit.override`, используются два разных exact approved request одного
+command/payload; discount approval остаётся публичным аргументом, debt approval
+передаётся как `debt_terms.limit_override_approval_id`. Погашение исторического
+долга допускает inactive customer role и archived counterparty, но не создаёт
+новую commercial activity. Controlled sale reversal сохраняет historical
+customer snapshot после завершения customer role или архивирования party,
+если original sale, organization и customer совпадают; ordinary sale и прямой
+INSERT этого исключения не получают.
 
 Return использует debt-first contract. Initial debt каждой sale line
 пропорционален `sale.debt_amount * line_total / sale.total`; округление идёт до
@@ -2197,26 +2209,44 @@ collection/write-off или другой debt allocation блокируется
 `V2_SALE_REVERSAL_DEBT_ACTIVITY_EXISTS`; pristine debt закрывается allocation с
 source `sale_reversal_id` и exact opposite settlement entry.
 
-Debt payment reversal проводится в текущей open shift и не меняет historical
+Payment graph проверяет exact source: refund связан с confirmed payment именно
+original sale, return reversal — с payment original return, debt-payment
+reversal — с payment original debt header; method, currency и exact opposite
+amount также совпадают. Cross-sale/cross-branch substitution отклоняется
+`V2_PAYMENT_SOURCE_GRAPH_MISMATCH`. Debt payment reversal проводится в текущей open shift и не меняет historical
 shift; write-off и его reversal требуют отдельные approvals. Все изменения
 projection выводятся из signed append-only allocations. Purchase posting пишет
 отрицательную settlement entry, reversal — точную положительную opposite row.
+Purchase settlement получает command ID только из function-owned transaction
+context фактического post/reversal command; поиск по
+`organization_id + local_operation_id + limit 1` не используется.
 Supplier payment откладывается до 0016; goods-taken document исключён из Core
 Pilot 0015, хотя ledger type зарезервирован как extension point.
 
-Settlement periods всегда scoped по currency и не прикрепляют entries через
-mutable FK. Close создаёт immutable ordered act lines и canonical snapshot hash;
+Все writers и period close используют один `v2_lock_settlement_scope` для
+organization/counterparty/currency до финансового read/mutation. Это
+сериализует close с новыми entries, credit sales, payment/return/write-off и их
+reversal. Settlement periods всегда scoped по currency и не прикрепляют entries через
+mutable FK. Close под тем же lock создаёт immutable ordered act lines и canonical snapshot hash;
 late correction допускается только новым более поздним correction period.
-Safe journals применяют debts/settlements permissions, branch scope и exact
-support grants; supplier purchase entries дополнительно требуют
-`purchases.cost.view`. Semantic outbox/audit events коррелируются command ID и
+`v2_settlement_journal` является filtered journal: он применяет
+debts/settlements permissions, branch scope и exact support grants и может
+скрывать purchase entries без `purchases.cost.view`; он не используется для
+authoritative total. `v2_counterparty_balance`, periods, acts и act lines
+доступны только при full-scope visibility, включая `purchases.cost.view` для
+каждой branch с purchase entries; иначе balance выдаёт
+`V2_SETTLEMENT_FULL_VISIBILITY_REQUIRED`, а snapshot полностью скрыт. Source
+guards дополнительно сверяют organization, branch, party, currency, sign,
+exact reversal document, command и period range/amount snapshot. Semantic
+outbox/audit events коррелируются exact command ID и
 не содержат private contacts, tax IDs, notes, provider references или approval
 reason. Debt workflows выпускают `DebtOpened`, `DebtPaymentRecorded`,
 `DebtPartiallyRepaid`/`DebtClosed`, `DebtPaymentReversed`, `DebtReopened`,
 `DebtReducedByReturn`, `DebtRestoredByReturnReversal`, `DebtWrittenOff`,
 `DebtWriteOffReversed`, `ReceivableReversed`, `SettlementEntryPosted` и
 `SettlementEntryReversed`; close выпускает `SettlementPeriodClosed` и
-`SettlementActCreated`. Exact replay возвращает прежний entity ID и не
+`SettlementActCreated`. `DebtReopened` создаётся только при реальном переходе
+terminal → open/partial. Exact replay возвращает прежний entity ID и не
 дублирует financial rows, inventory/payment graph или semantic events;
 изменённый payload отклоняется stable idempotency error.
 
