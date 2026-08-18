@@ -2486,6 +2486,12 @@ conflict; неожиданные SQL errors откатывают весь sync r
 nonterminal dependency оставляет row в `received`, failed dependency и
 recursive cycle создают conflict. Conflict resolution всегда создаёт новый
 envelope, требует `sync.resolve` и не заменяет domain permission/approval.
+Проверка `sync.resolve` выполняется и preferred wrapper
+`v2_resolve_sync_conflict`, и самим `v2_submit_sync_command`, когда передан
+`resolution_of_id`: прямой вызов submit не является обходом authorization.
+Trigger guard независимо проверяет tenant устройства и actor membership, а
+accepted envelope может ссылаться только на succeeded `command_log` с теми же
+organization, device и `local_operation_id`.
 
 `outbox_events.sync_cursor` — immutable per-organization cursor. Исторические
 V2 events получают deterministic `(created_at,id)` order; новые значения
@@ -2496,7 +2502,12 @@ cursor не использует sequence и не публикует commit-orde
 water. Seller получает own-device technical events, разрешённые branch
 invalidations и безопасные catalog/pricing/settings invalidations; privileged
 supplier-cost, settlement и approval metadata скрыты. Owner получает safe
-organization-wide metadata.
+organization-wide metadata. Для submit, pull и ACK одной trusted device
+недостаточно: active owner имеет organization-wide доступ, а non-owner должен
+иметь `v2_can_access_branch` для `device.branch_id`. Seller technical sync event
+дополнительно связан с `sync_commands.actor_membership_id`, поэтому общий device
+не раскрывает статус команды другого actor. Sync journal для non-owner также
+фильтруется по actor membership; optional device filter только сужает результат.
 
 Worker API доступен только `service_role`: claim использует `FOR UPDATE SKIP
 LOCKED`, exact worker lease и attempt limit; deliver/fail проверяют владельца
@@ -2511,7 +2522,11 @@ Canonical shift close под существующим operation/register lock п
 того же register. Собственная `shift.close` sync row исключается, а unresolved
 dependencies не запускают close. Safe sync/audit journals и outbox/event
 diagnostics редактируют payload/PII; полный RLS role matrix остаётся задачей
-0018, полная business reconciliation — 0020.
+0018, полная business reconciliation — 0020. Infrastructure reconciliation
+принимает worker `max_attempts` (default `5`), считает exhausted только failed
+outbox rows с `attempt_count >= max_attempts`, отдельно выявляет отсутствие
+audit или outbox стороны event-bearing command и требует ровно по одному
+technical audit/outbox event для каждого terminal sync command.
 
 | Migration | Ответственность и таблицы | Legacy changes | Dependencies / compatibility | Pre/post checks и forward recovery |
 | --- | --- | --- | --- | --- |

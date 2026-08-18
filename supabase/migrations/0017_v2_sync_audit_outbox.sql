@@ -60,7 +60,7 @@ create index sync_commands_resolution_idx on public.sync_commands(resolution_of_
 
 create or replace function public.v2_guard_sync_command()
 returns trigger language plpgsql set search_path='' as $$
-declare x uuid;source public.sync_commands%rowtype;
+declare device_tenant uuid;actor_tenant uuid;source public.sync_commands%rowtype;command_row public.command_log%rowtype;
 begin
   if exists(select 1 from unnest(new.dependency_operation_ids) d where d is null or d='00000000-0000-0000-0000-000000000000'::uuid)
      or cardinality(new.dependency_operation_ids)<>(select count(distinct d) from unnest(new.dependency_operation_ids)d)
@@ -72,6 +72,25 @@ begin
     if source.id is null or source.organization_id<>new.organization_id or source.status<>'conflict' then
       raise exception using errcode='P0001',message='V2_SYNC_RESOLUTION_SOURCE_INVALID';
     end if;
+  end if;
+  select organization_id into device_tenant from public.devices_v2 where id=new.device_id;
+  if device_tenant is null or device_tenant<>new.organization_id then
+    raise exception using errcode='P0001',message='V2_SYNC_DEVICE_TENANT_MISMATCH';
+  end if;
+  select organization_id into actor_tenant from public.organization_memberships where id=new.actor_membership_id;
+  if actor_tenant is null or actor_tenant<>new.organization_id then
+    raise exception using errcode='P0001',message='V2_SYNC_ACTOR_TENANT_MISMATCH';
+  end if;
+  if new.command_id is not null then
+    select * into command_row from public.command_log where id=new.command_id;
+    if command_row.id is null or command_row.organization_id<>new.organization_id
+      or command_row.device_id is distinct from new.device_id
+      or command_row.local_operation_id is distinct from new.local_operation_id then
+      raise exception using errcode='P0001',message='V2_SYNC_COMMAND_CORRELATION_INVALID';
+    end if;
+  end if;
+  if new.status='accepted'and(new.command_id is null or command_row.status is distinct from'succeeded')then
+    raise exception using errcode='P0001',message='V2_SYNC_ACCEPTED_COMMAND_NOT_SUCCEEDED';
   end if;
   if tg_op='UPDATE' then
     if new.id is distinct from old.id or new.organization_id is distinct from old.organization_id
@@ -263,12 +282,24 @@ create or replace function public.v2_submit_sync_command(
   schema_version integer,payload jsonb,client_created_at timestamptz,
   dependency_operation_ids uuid[] default'{}',resolution_of_id uuid default null
 )returns jsonb language plpgsql security definer set search_path='' as $$
-declare a uuid;s public.sync_commands%rowtype;h text;dep_state text;dispatch_result jsonb;code text;command uuid;
+declare a uuid;s public.sync_commands%rowtype;source public.sync_commands%rowtype;d public.devices_v2%rowtype;owner_access boolean;h text;dep_state text;dispatch_result jsonb;code text;command uuid;
 begin
   a:=public.v2_current_membership_id(organization_id);
   if a is null then raise exception using errcode='P0001',message='V2_SYNC_ACTIVE_MEMBERSHIP_REQUIRED';end if;
-  if not exists(select 1 from public.devices_v2 d where d.id=v2_submit_sync_command.device_id and d.organization_id=v2_submit_sync_command.organization_id and d.status='trusted'and d.revoked_at is null)then
+  select * into d from public.devices_v2 x where x.id=v2_submit_sync_command.device_id and x.organization_id=v2_submit_sync_command.organization_id;
+  if d.id is null or d.status<>'trusted'or d.revoked_at is not null then
     raise exception using errcode='P0001',message='V2_SYNC_TRUSTED_DEVICE_REQUIRED';
+  end if;
+  select system_role='owner'into owner_access from public.organization_memberships where id=a;
+  if not owner_access and not public.v2_can_access_branch(organization_id,d.branch_id)then
+    raise exception using errcode='P0001',message='V2_SYNC_DEVICE_ACCESS_REQUIRED';
+  end if;
+  if v2_submit_sync_command.resolution_of_id is not null then
+    select * into source from public.sync_commands x where x.id=v2_submit_sync_command.resolution_of_id;
+    if source.id is null or source.status<>'conflict'or source.organization_id<>v2_submit_sync_command.organization_id
+      or not public.v2_has_permission(v2_submit_sync_command.organization_id,'sync.resolve',null)then
+      raise exception using errcode='P0001',message='V2_SYNC_RESOLVE_REQUIRED';
+    end if;
   end if;
   perform public.v2_lock_operation_scope(organization_id,device_id,local_operation_id);
   h:=encode(extensions.digest(jsonb_build_object('command_type',command_type,'schema_version',schema_version,'payload',payload,'dependencies',coalesce(dependency_operation_ids,'{}'::uuid[]),'resolution_of_id',resolution_of_id,'client_created_at',client_created_at)::text,'sha256'),'hex');
@@ -356,18 +387,21 @@ end$$;
 -- Safe pull and ACK ---------------------------------------------------------
 create or replace function public.v2_pull_sync_changes(organization_id uuid,device_id uuid,after_cursor bigint,requested_limit integer)
 returns jsonb language plpgsql stable security definer set search_path='' as $$
-declare a uuid;role_code text;scan_to bigint;events jsonb;more boolean;
+declare a uuid;role_code text;d public.devices_v2%rowtype;scan_to bigint;events jsonb;more boolean;
 begin
   if requested_limit not between 1 and 500 or after_cursor<0 then raise exception using errcode='P0001',message='V2_SYNC_PULL_ARGUMENT_INVALID';end if;
   a:=public.v2_current_membership_id(organization_id);
-  if a is null or not exists(select 1 from public.devices_v2 d where d.id=v2_pull_sync_changes.device_id and d.organization_id=v2_pull_sync_changes.organization_id and d.status='trusted'and d.revoked_at is null)then raise exception using errcode='P0001',message='V2_SYNC_TRUSTED_DEVICE_REQUIRED';end if;
+  select * into d from public.devices_v2 x where x.id=v2_pull_sync_changes.device_id and x.organization_id=v2_pull_sync_changes.organization_id;
+  if a is null then raise exception using errcode='P0001',message='V2_SYNC_ACTIVE_MEMBERSHIP_REQUIRED';end if;
+  if d.id is null or d.status<>'trusted'or d.revoked_at is not null then raise exception using errcode='P0001',message='V2_SYNC_TRUSTED_DEVICE_REQUIRED';end if;
   select system_role into role_code from public.organization_memberships where id=a;
+  if role_code<>'owner'and not public.v2_can_access_branch(organization_id,d.branch_id)then raise exception using errcode='P0001',message='V2_SYNC_DEVICE_ACCESS_REQUIRED';end if;
   with scanned as(select * from public.outbox_events e where e.organization_id=v2_pull_sync_changes.organization_id and e.sync_cursor>after_cursor order by e.sync_cursor limit requested_limit)
   select coalesce(max(sync_cursor),after_cursor),coalesce(jsonb_agg(jsonb_build_object('cursor',sync_cursor,'aggregate_type',aggregate_type,'aggregate_id',aggregate_id,'event_type',event_type,'event_version',event_version,'created_at',created_at)order by sync_cursor)filter(where
     role_code='owner'or(
-      (aggregate_type='sync_command'and exists(select 1 from public.sync_commands q where q.id=aggregate_id and q.device_id=v2_pull_sync_changes.device_id))
+      (aggregate_type='sync_command'and exists(select 1 from public.sync_commands q where q.id=aggregate_id and q.device_id=v2_pull_sync_changes.device_id and q.actor_membership_id=a))
       or(aggregate_type in('product','category','brand','unit','product_type','price_list','organization_settings'))
-      or(aggregate_type not in('purchase','supplier_payment','settlement','settlement_period','settlement_act','approval_request')and exists(select 1 from public.audit_events a0 where a0.organization_id=v2_pull_sync_changes.organization_id and a0.correlation_id=scanned.correlation_id and a0.branch_id is not null and public.v2_can_access_branch(v2_pull_sync_changes.organization_id,a0.branch_id)))
+      or(aggregate_type not in('sync_command','purchase','supplier_payment','settlement','settlement_period','settlement_act','approval_request')and exists(select 1 from public.audit_events a0 where a0.organization_id=v2_pull_sync_changes.organization_id and a0.correlation_id=scanned.correlation_id and a0.branch_id is not null and public.v2_can_access_branch(v2_pull_sync_changes.organization_id,a0.branch_id)))
     )),'[]'::jsonb)
   into scan_to,events from scanned;
   select exists(select 1 from public.outbox_events e where e.organization_id=v2_pull_sync_changes.organization_id and e.sync_cursor>scan_to)into more;
@@ -376,11 +410,14 @@ end$$;
 
 create or replace function public.v2_ack_sync_cursor(organization_id uuid,device_id uuid,cursor bigint)
 returns jsonb language plpgsql security definer set search_path='' as $$
-declare a uuid;high bigint;d public.devices_v2%rowtype;
+declare a uuid;role_code text;high bigint;d public.devices_v2%rowtype;
 begin
   a:=public.v2_current_membership_id(organization_id);
   select * into d from public.devices_v2 x where x.id=v2_ack_sync_cursor.device_id and x.organization_id=v2_ack_sync_cursor.organization_id for update;
-  if a is null or d.id is null or d.status<>'trusted'or d.revoked_at is not null then raise exception using errcode='P0001',message='V2_SYNC_TRUSTED_DEVICE_REQUIRED';end if;
+  if a is null then raise exception using errcode='P0001',message='V2_SYNC_ACTIVE_MEMBERSHIP_REQUIRED';end if;
+  if d.id is null or d.status<>'trusted'or d.revoked_at is not null then raise exception using errcode='P0001',message='V2_SYNC_TRUSTED_DEVICE_REQUIRED';end if;
+  select system_role into role_code from public.organization_memberships where id=a;
+  if role_code<>'owner'and not public.v2_can_access_branch(organization_id,d.branch_id)then raise exception using errcode='P0001',message='V2_SYNC_DEVICE_ACCESS_REQUIRED';end if;
   select coalesce(last_cursor,0)into high from public.sync_cursor_state where sync_cursor_state.organization_id=v2_ack_sync_cursor.organization_id;
   if cursor<d.last_sync_cursor then raise exception using errcode='P0001',message='V2_SYNC_ACK_DECREASE_FORBIDDEN';end if;
   if cursor>coalesce(high,0)then raise exception using errcode='P0001',message='V2_SYNC_ACK_EXCEEDS_HIGH_WATER';end if;
@@ -413,7 +450,7 @@ returns table(id uuid,device_id uuid,local_operation_id uuid,command_type text,s
 language plpgsql stable security definer set search_path='' as $$
 declare a uuid;owner_access boolean;
 begin a:=public.v2_current_membership_id(p_organization_id);if a is null then raise exception using errcode='P0001',message='V2_SYNC_ACTIVE_MEMBERSHIP_REQUIRED';end if;select system_role='owner'into owner_access from public.organization_memberships where organization_memberships.id=a;
-return query select s.id,s.device_id,s.local_operation_id,s.command_type,s.status,s.command_id,s.result,s.error_code,s.received_at,s.processed_at from public.sync_commands s where s.organization_id=p_organization_id and(owner_access or s.device_id=p_device_id)and(p_device_id is null or s.device_id=p_device_id)order by s.received_at desc,s.id;end$$;
+return query select s.id,s.device_id,s.local_operation_id,s.command_type,s.status,s.command_id,s.result,s.error_code,s.received_at,s.processed_at from public.sync_commands s where s.organization_id=p_organization_id and(owner_access or s.actor_membership_id=a)and(p_device_id is null or s.device_id=p_device_id)order by s.received_at desc,s.id;end$$;
 
 create or replace function public.v2_audit_journal(organization_id uuid,after_created_at timestamptz default '-infinity',requested_limit integer default 100)
 returns table(id uuid,created_at timestamptz,action text,entity_type text,entity_id uuid,correlation_id uuid,branch_id uuid)
@@ -425,23 +462,23 @@ returns table(status text,event_count bigint,oldest_age_seconds bigint,max_attem
 language plpgsql volatile security definer set search_path='' as $$
 begin if not(public.v2_has_permission(organization_id,'audit.view',null)or public.v2_has_support_grant(organization_id,'audit.view'))then raise exception using errcode='P0001',message='V2_AUDIT_VIEW_REQUIRED';end if;return query select e.status,count(*),extract(epoch from clock_timestamp()-min(e.created_at))::bigint,max(e.attempt_count)from public.outbox_events e where e.organization_id=v2_outbox_diagnostics.organization_id group by e.status order by e.status;end$$;
 
-create or replace function public.v2_event_reconciliation(organization_id uuid)
+create or replace function public.v2_event_reconciliation(organization_id uuid,max_attempts integer default 5)
 returns table(issue_code text,entity_id uuid,details jsonb)
 language plpgsql volatile security definer set search_path='' as $$
-begin if not(public.v2_has_permission(organization_id,'audit.view',null)or public.v2_has_support_grant(organization_id,'audit.view'))then raise exception using errcode='P0001',message='V2_AUDIT_VIEW_REQUIRED';end if;
+begin if max_attempts<1 then raise exception using errcode='P0001',message='V2_RECONCILE_MAX_ATTEMPTS_INVALID';end if;if not(public.v2_has_permission(organization_id,'audit.view',null)or public.v2_has_support_grant(organization_id,'audit.view'))then raise exception using errcode='P0001',message='V2_AUDIT_VIEW_REQUIRED';end if;
 return query
  select'V2_RECONCILE_SYNC_COMMAND_NOT_SUCCEEDED',s.id,jsonb_build_object('command_id',s.command_id)from public.sync_commands s left join public.command_log c on c.id=s.command_id where s.organization_id=v2_event_reconciliation.organization_id and s.status='accepted'and(c.id is null or c.status<>'succeeded')
  union all select'V2_RECONCILE_SYNC_COMMAND_TENANT',s.id,'{}'::jsonb from public.sync_commands s join public.command_log c on c.id=s.command_id where s.organization_id=v2_event_reconciliation.organization_id and c.organization_id<>s.organization_id
- union all select'V2_RECONCILE_SYNC_TECH_EVENT',s.id,jsonb_build_object('event_count',count(e.id))from public.sync_commands s left join public.outbox_events e on e.organization_id=s.organization_id and e.aggregate_type='sync_command'and e.aggregate_id=s.id where s.organization_id=v2_event_reconciliation.organization_id and s.status in('accepted','rejected','conflict')group by s.id having count(e.id)<>1
+ union all select'V2_RECONCILE_SYNC_TECH_EVENT',s.id,jsonb_build_object('audit_event_count',a.audit_count,'outbox_event_count',o.outbox_count)from public.sync_commands s cross join lateral(select count(*)audit_count,bool_or(x.action=case s.status when'accepted'then'SyncCommandAccepted'when'rejected'then'SyncCommandRejected'else'SyncConflictRaised'end)expected from public.audit_events x where x.organization_id=s.organization_id and x.entity_type='sync_command'and x.entity_id=s.id and x.correlation_id=s.id)a cross join lateral(select count(*)outbox_count,bool_or(x.event_type=case s.status when'accepted'then'SyncCommandAccepted'when'rejected'then'SyncCommandRejected'else'SyncConflictRaised'end)expected from public.outbox_events x where x.organization_id=s.organization_id and x.aggregate_type='sync_command'and x.aggregate_id=s.id and x.correlation_id=s.id)o where s.organization_id=v2_event_reconciliation.organization_id and s.status in('accepted','rejected','conflict')and(a.audit_count<>1 or o.outbox_count<>1 or not coalesce(a.expected,false)or not coalesce(o.expected,false))
  union all select'V2_RECONCILE_OUTBOX_CURSOR',e.id,jsonb_build_object('cursor',e.sync_cursor)from public.outbox_events e where e.organization_id=v2_event_reconciliation.organization_id and(e.sync_cursor is null or e.sync_cursor<=0)
- union all select'V2_RECONCILE_OUTBOX_EXHAUSTED',e.id,jsonb_build_object('attempt_count',e.attempt_count)from public.outbox_events e where e.organization_id=v2_event_reconciliation.organization_id and e.status='failed'and e.attempt_count>0 and e.available_at<=clock_timestamp()
- union all select'V2_RECONCILE_EVENT_COVERAGE',c.id,'{}'::jsonb from public.command_log c where c.organization_id=v2_event_reconciliation.organization_id and c.status='succeeded'and c.entity_id is not null and not exists(select 1 from public.audit_events a where a.command_log_id=c.id)and not exists(select 1 from public.outbox_events o where o.correlation_id=c.id);
+ union all select'V2_RECONCILE_OUTBOX_EXHAUSTED',e.id,jsonb_build_object('attempt_count',e.attempt_count,'max_attempts',max_attempts)from public.outbox_events e where e.organization_id=v2_event_reconciliation.organization_id and e.status='failed'and e.attempt_count>=max_attempts
+ union all select'V2_RECONCILE_EVENT_COVERAGE',c.id,jsonb_build_object('audit_present',exists(select 1 from public.audit_events a where a.command_log_id=c.id),'outbox_present',exists(select 1 from public.outbox_events o where o.correlation_id=c.id))from public.command_log c where c.organization_id=v2_event_reconciliation.organization_id and c.status='succeeded'and c.entity_id is not null and(not exists(select 1 from public.audit_events a where a.command_log_id=c.id)or not exists(select 1 from public.outbox_events o where o.correlation_id=c.id));
 end$$;
 
 -- Privileges ---------------------------------------------------------------
 revoke execute on function public.v2_guard_sync_command(),public.v2_assign_outbox_sync_cursor(),public.v2_sync_error_is_conflict(text),public.v2_emit_sync_technical_event(uuid,text,text),public.v2_sync_validate_payload(text,jsonb),public.v2_dispatch_sync_command(uuid),public.v2_sync_dependency_state(uuid),public.v2_close_shift_0016_sync_base(uuid,uuid,jsonb,jsonb,uuid,uuid)from public,anon,authenticated;
-revoke execute on function public.v2_submit_sync_command(uuid,uuid,uuid,text,integer,jsonb,timestamptz,uuid[],uuid),public.v2_resolve_sync_conflict(uuid,uuid,uuid,text,integer,jsonb,timestamptz,uuid[]),public.v2_pull_sync_changes(uuid,uuid,bigint,integer),public.v2_ack_sync_cursor(uuid,uuid,bigint),public.v2_sync_command_journal(uuid,uuid),public.v2_audit_journal(uuid,timestamptz,integer),public.v2_outbox_diagnostics(uuid),public.v2_event_reconciliation(uuid)from public,anon;
-grant execute on function public.v2_submit_sync_command(uuid,uuid,uuid,text,integer,jsonb,timestamptz,uuid[],uuid),public.v2_resolve_sync_conflict(uuid,uuid,uuid,text,integer,jsonb,timestamptz,uuid[]),public.v2_pull_sync_changes(uuid,uuid,bigint,integer),public.v2_ack_sync_cursor(uuid,uuid,bigint),public.v2_sync_command_journal(uuid,uuid),public.v2_audit_journal(uuid,timestamptz,integer),public.v2_outbox_diagnostics(uuid),public.v2_event_reconciliation(uuid)to authenticated;
+revoke execute on function public.v2_submit_sync_command(uuid,uuid,uuid,text,integer,jsonb,timestamptz,uuid[],uuid),public.v2_resolve_sync_conflict(uuid,uuid,uuid,text,integer,jsonb,timestamptz,uuid[]),public.v2_pull_sync_changes(uuid,uuid,bigint,integer),public.v2_ack_sync_cursor(uuid,uuid,bigint),public.v2_sync_command_journal(uuid,uuid),public.v2_audit_journal(uuid,timestamptz,integer),public.v2_outbox_diagnostics(uuid),public.v2_event_reconciliation(uuid,integer)from public,anon;
+grant execute on function public.v2_submit_sync_command(uuid,uuid,uuid,text,integer,jsonb,timestamptz,uuid[],uuid),public.v2_resolve_sync_conflict(uuid,uuid,uuid,text,integer,jsonb,timestamptz,uuid[]),public.v2_pull_sync_changes(uuid,uuid,bigint,integer),public.v2_ack_sync_cursor(uuid,uuid,bigint),public.v2_sync_command_journal(uuid,uuid),public.v2_audit_journal(uuid,timestamptz,integer),public.v2_outbox_diagnostics(uuid),public.v2_event_reconciliation(uuid,integer)to authenticated;
 revoke execute on function public.v2_claim_outbox_events(text,integer,integer),public.v2_mark_outbox_delivered(uuid,text),public.v2_mark_outbox_failed(uuid,text,text,integer),public.v2_requeue_stale_outbox(integer)from public,anon,authenticated;
 grant execute on function public.v2_claim_outbox_events(text,integer,integer),public.v2_mark_outbox_delivered(uuid,text),public.v2_mark_outbox_failed(uuid,text,text,integer),public.v2_requeue_stale_outbox(integer)to service_role;
 revoke execute on function public.v2_close_shift(uuid,uuid,jsonb,jsonb,uuid,uuid)from public,anon;
