@@ -2463,6 +2463,56 @@ token с другим результатом — completion payload mismatch.
 `external_receipt_id` и provider `response_code` являются разными полями;
 issued требует receipt, failed — error code, deferred запрещает receipt.
 
+### 75.1. Offline sync, ordered outbox и технический аудит (0017)
+
+`public.sync_commands` — authoritative V2 queue для одного offline business
+command на envelope. Legacy `public.sync_operations` остаётся V1-таблицей и не
+участвует ни в dispatch, ни в shift-close blocker. Identity envelope
+`(organization, device, local_operation_id, type, schema, payload,
+dependencies, client_created_at, resolution source)` неизменяем; exact replay
+возвращает сохранённый terminal result, а изменённый replay получает
+`V2_SYNC_IDEMPOTENCY_MISMATCH`. `client_created_at` — только metadata и никогда
+не определяет authorization или серверный порядок.
+
+Dispatcher является закрытым статическим allowlist без dynamic SQL. В 0017
+offline поддерживаются только `shift.open`, `sale.post`, `sale.return`,
+`debt_payment.record`, `cash.movement.record` и `shift.close`; они вызывают
+существующие canonical V2 RPC, поэтому permission, approval, pricing, stock,
+credit/debt, shift и cash rules не дублируются. Domain RPC выполняется внутри
+PL/pgSQL exception subtransaction: ожидаемая `P0001` полностью откатывает
+domain graph и сохраняет фактический стабильный error code как rejected или
+conflict; неожиданные SQL errors откатывают весь sync request. Dependencies
+разрешаются только в пределах того же organization/device; missing или
+nonterminal dependency оставляет row в `received`, failed dependency и
+recursive cycle создают conflict. Conflict resolution всегда создаёт новый
+envelope, требует `sync.resolve` и не заменяет domain permission/approval.
+
+`outbox_events.sync_cursor` — immutable per-organization cursor. Исторические
+V2 events получают deterministic `(created_at,id)` order; новые значения
+выделяются под row lock в `sync_cursor_state` в той же transaction. Поэтому
+cursor не использует sequence и не публикует commit-order gap. Pull возвращает
+только safe invalidation metadata, не raw payload, и продвигает scan cursor
+через скрытые события; ACK отделён от pull, monotonic и ограничен tenant high
+water. Seller получает own-device technical events, разрешённые branch
+invalidations и безопасные catalog/pricing/settings invalidations; privileged
+supplier-cost, settlement и approval metadata скрыты. Owner получает safe
+organization-wide metadata.
+
+Worker API доступен только `service_role`: claim использует `FOR UPDATE SKIP
+LOCKED`, exact worker lease и attempt limit; deliver/fail проверяют владельца
+lease, stale processing requeue переводит row в retryable failed, а exhausted
+failed row остаётся диагностическим и больше не claim-ится. Статусы outbox не
+расширяются dead-letter состоянием. Technical события ограничены
+`SyncCommandAccepted`, `SyncCommandRejected`, `SyncConflictRaised`, содержат
+только safe identifiers/status/error code и не дублируются при replay.
+
+Canonical shift close под существующим operation/register lock проверяет
+только committed `sync_commands` со статусом `received|processing` устройств
+того же register. Собственная `shift.close` sync row исключается, а unresolved
+dependencies не запускают close. Safe sync/audit journals и outbox/event
+diagnostics редактируют payload/PII; полный RLS role matrix остаётся задачей
+0018, полная business reconciliation — 0020.
+
 | Migration | Ответственность и таблицы | Legacy changes | Dependencies / compatibility | Pre/post checks и forward recovery |
 | --- | --- | --- | --- | --- |
 | `0007_v2_foundation.sql` | command_log, outbox, audit, migration exceptions, helpers | Нет | 0001–0006; additive | Extensions/types/grants; fix forward new migration |
@@ -2475,7 +2525,7 @@ issued требует receipt, failed — error code, deferred запрещае�
 | `0014_v2_sales_payments.sql` | physical `sales_v2`, lines/allocations, returns, held sales, `payments_v2`, minimal `shifts_v2`/totals, fiscal intents/attempts | V1 sales/payments/shifts retained; no backfill or dual-write | 0011,0013 | Fully-paid totals, FEFO, signed payments, fiscal intent, raw-cost RLS |
 | `0015_v2_debts_settlements.sql` | receivables, physical `debt_payments_v2`, signed allocations, settlement ledger/periods/immutable act snapshots | legacy `debt_payments` untouched; no backfill/dual-write | 0012,0014 | Debt and party ledger reconciliation by signed allocations/entries |
 | `0016_v2_shifts_cash.sql` | `cash_movements`, `shift_cash_counts`, unallocated `supplier_payments`; canonical shift open/close, safe journals and reconciliation | V1 shifts/payments/debt_payments retained; no backfill/dual-write | 0014–0015 | Register/shift serialization, signed payment-to-cash graph, zero-tolerance discrepancy approval, fiscal blocker; pending sync deferred to 0017 |
-| `0017_v2_sync_audit_outbox.sql` | sync commands, final event plumbing | sync_operations retained | all domain commands stable | Retry/idempotency/outbox tests |
+| `0017_v2_sync_audit_outbox.sql` | `sync_commands`, per-tenant `sync_cursor_state`, static offline dispatcher, safe pull/ACK, technical audit and service-role outbox worker | legacy `sync_operations` retained and ignored; no V1 backfill/dual-write | 0007–0016 canonical domain RPC | Envelope replay/dependencies, domain rollback, cursor/ACK, pending-shift blocker, lease lifecycle and event reconciliation |
 | `0018_v2_rls.sql` | RLS helpers, policies, grants, defensive triggers | Revoke unsafe V2 grants only | tables/backfill helpers | Role matrix and cross-tenant test suite |
 | `0019_v2_backfill.sql` | idempotent backfill procedures/checkpoints | Reads V1, writes V2 | 0007–0018 | Dry run, exceptions, restartability |
 | `0020_v2_reconciliation.sql` | reconciliation views/functions/reports | Legacy frozen after acceptance | 0019 | Zero critical mismatch before feature flag |
