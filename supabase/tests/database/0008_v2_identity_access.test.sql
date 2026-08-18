@@ -146,7 +146,7 @@ from (
 ) as relations(relation_name);
 
 -- Deterministic registry and templates.
-select is((select count(*) from public.permissions), 53::bigint, 'registry has 53 permissions');
+select is((select count(*) from public.permissions), 54::bigint, 'registry has 54 permissions');
 select is((select count(*) from public.permissions where critical), 10::bigint, 'registry has ten critical permissions');
 select set_eq(
   $$select code from public.permissions where critical$$,
@@ -179,7 +179,7 @@ select is(
     from public.permission_profile_permissions
     where permission_profile_id = '00000000-0000-0000-0000-000000000101'
   ),
-  53::bigint,
+  54::bigint,
   'owner template contains every permission'
 );
 select is(
@@ -855,8 +855,8 @@ select throws_ok(
 );
 select is(
   (select count(*) from public.permissions),
-  53::bigint,
-  'runtime guard preserves the exact 53-permission registry'
+  54::bigint,
+  'runtime guard preserves the exact 54-permission registry'
 );
 
 select ok(

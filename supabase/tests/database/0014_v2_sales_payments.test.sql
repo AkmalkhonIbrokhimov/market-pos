@@ -30,9 +30,9 @@ select is(i.column_default is not null,e.has_default,e.table_name||'.'||e.column
 
 -- Coexistence, permissions, templates and inventory source extension.
 select has_table('public',t,'legacy '||t||' remains')from(values('sales'),('sale_items'),('payments'),('shifts'))x(t);
-select is((select count(*)from permissions),53::bigint,'permission registry 53');
+select is((select count(*)from permissions),54::bigint,'permission registry 54');
 select is((select count(*)from permissions where critical),10::bigint,'critical registry ten');
-select is((select count(*)from permission_profile_permissions where permission_profile_id='00000000-0000-0000-0000-000000000101'),53::bigint,'owner template 53');
+select is((select count(*)from permission_profile_permissions where permission_profile_id='00000000-0000-0000-0000-000000000101'),54::bigint,'owner template 54');
 select is((select count(*)from permission_profile_permissions where permission_profile_id='00000000-0000-0000-0000-000000000102'),16::bigint,'seller template 16');
 select ok(exists(select 1 from permissions where code='sales.cost.view'and module='sales'and not critical),'sales.cost.view registered');
 select ok(exists(select 1 from permission_profile_permissions ppp join permissions p on p.id=ppp.permission_id where ppp.permission_profile_id='00000000-0000-0000-0000-000000000101'and p.code='sales.cost.view'),'owner receives cost permission');

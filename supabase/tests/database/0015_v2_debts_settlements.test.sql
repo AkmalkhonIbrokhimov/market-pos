@@ -12,9 +12,9 @@ select ok(not has_table_privilege('authenticated',format('public.%I',t),'INSERT,
 select ok(has_table_privilege('authenticated',format('public.%I',t),'SELECT'),'authenticated SELECT via RLS '||t)from(values('receivables'),('debt_payments_v2'),('debt_allocations'),('settlement_entries'),('settlement_periods'),('settlement_acts'),('settlement_act_lines'))x(t);
 
 -- Permission registry is exact after 0015.
-select is((select count(*)from permissions),53::bigint,'permission registry 53');
+select is((select count(*)from permissions),54::bigint,'permission registry 54');
 select is((select count(*)from permissions where critical),10::bigint,'critical permissions 10');
-select is((select count(*)from permission_profile_permissions where permission_profile_id='00000000-0000-0000-0000-000000000101'),53::bigint,'owner profile 53');
+select is((select count(*)from permission_profile_permissions where permission_profile_id='00000000-0000-0000-0000-000000000101'),54::bigint,'owner profile 54');
 select is((select count(*)from permission_profile_permissions where permission_profile_id='00000000-0000-0000-0000-000000000102'),16::bigint,'seller profile remains 16');
 select set_eq($$select code from permissions where critical$$,$$select * from(values('purchases.reverse'),('sales.reverse'),('sales.discount.override'),('debts.limit.override'),('cash.move.override'),('support.access.approve'),('debts.reverse'),('debts.write_off'),('settlements.close'),('settlements.reverse'))x(code)$$,'critical permission set exact');
 select ok(exists(select 1 from permissions where code=p and module=m and critical),p||' registered critical')from(values('debts.reverse','debts'),('debts.write_off','debts'),('settlements.close','settlements'))x(p,m);
