@@ -825,8 +825,11 @@ Permission registry модуля `counterparties` содержит:
 `counterparties.customer.view`, `counterparties.customer.create`,
 `counterparties.credit.view` и `counterparties.credit.manage`. Owner template
 получает все шесть прав. Seller template получает только customer view/create и
-credit view: seller видит customer parties, только customer role и связанные
-contacts/addresses, но не supplier-only directory. Credit policy отделена от
+credit view: seller читает активных customers через безопасный
+`v2_customer_directory`, который возвращает только display name, status и
+primary phone. Raw party, role, contact и address rows требуют полного
+`counterparties.view/manage`; legal name, tax id, notes, адреса и произвольные
+контакты seller не раскрываются. Credit policy отделена от
 обычных debt overrides. Расширение `seller_default` увеличивает
 `permission_version` ровно на один для active memberships с этим template,
 инвалидируя offline/client permission cache; inactive и несвязанные memberships
@@ -1847,7 +1850,15 @@ Unique migration/table/id/error. Index open exceptions.
 
 ## 67. RLS-архитектура
 
-Коды: `S` select, `I` insert, `U` update, `D` delete. `C` означает только server command/RPC. Любое право требует active profile, active membership, совпадающий tenant и, для branch-owned данных, `branch_access`. Service admin дополнительно требует действующий ограниченный `support_access_grant`; все его действия попадают в Audit.
+Коды: `S` select, `I` insert, `U` update, `D` delete. `C` означает только server command/RPC. Любое право требует active profile, active membership, совпадающий tenant и, для branch-owned данных, `branch_access`. Service admin не считается owner и получает доступ только по точному scope действующего, начавшегося и неистёкшего `support_access_grant`; scope не наследуют права других модулей.
+
+Migration 0018 разделяет raw RLS и безопасные projection RPC. RLS фильтрует
+строки, но не редактирует колонки, поэтому `devices_v2` с fingerprint/legacy
+mapping/cursor и полные counterparty rows доступны только управляющим правам.
+Seller использует `v2_device_directory` и `v2_customer_directory`; management
+членов использует `v2_member_directory`. Эти SECURITY DEFINER функции имеют
+`search_path=''`, собственную проверку active identity, tenant/branch scope и
+не принимают переданный organization как доказательство доступа.
 
 | Таблица или группа | Owner | Seller | Service admin | Anonymous |
 | --- | --- | --- | --- | --- |
@@ -1855,13 +1866,13 @@ Unique migration/table/id/error. Index open exceptions.
 | user_profiles/memberships | S,I,U | S self | S,U по grant | — |
 | permissions/profiles/access | S,I,U,D config | S own | S,U по grant | — |
 | approval_requests | S,I,U decision | S,I own | S,U по grant | — |
-| branches/warehouses/registers/devices | S,I,U | S assigned | S,U по grant | — |
+| branches/warehouses/registers/devices | S,I,U | S assigned; devices safe projection | S по exact grant; mutation C | — |
 | catalog references/products | S,I,U | S | S,I,U по grant | — |
-| prices/recommendations/history | S,C | S current | S,C по grant | — |
-| counterparties/contacts | S,I,U | S,I limited | S,I,U по grant | — |
+| prices/recommendations/history | S,C | S только active/current | S,C по exact grant | — |
+| counterparties/contacts | S,I,U | safe customer projection, C quick create | S по exact grant; mutation C | — |
 | purchase drafts | S,I,U,D draft | S only by permission | S,I,U по grant | — |
 | posted purchases/batches | S,C | S limited | S,C по grant | — |
-| inventory documents/ledgers | S,C | S projection | S,C по grant | — |
+| inventory documents/ledgers | S,C | balances projection; raw только adjust/transfer | S,C по exact grant | — |
 | inventory_balances | S | S assigned | S по grant | — |
 | sale drafts/held sales | S,I,U,D own | S,I,U,D own | S по grant | — |
 | posted sales/returns | S,C | S,C own branch/shift | S,C по grant | — |
@@ -1870,14 +1881,28 @@ Unique migration/table/id/error. Index open exceptions.
 | settlements/acts | S,C | S limited | S,C по grant | — |
 | shifts/totals | S,C | S,C own register | S,C по grant | — |
 | fiscal documents | S,C | S own shift | S,C по grant | — |
-| sync_commands/command results | S own tenant | S own device | S по grant | — |
+| sync_commands/command results | safe tenant journal | safe own-actor journal | safe journal по exact `devices.manage` | — |
 | outbox/technical attempts | diagnostic view | — | S по grant | — |
 | audit_events | S | S own limited | S own/grant | — |
 | notifications | S,U own | S,U own | S,U own | — |
 | report projections | S | S permitted subset | S по grant | — |
 | migration_exceptions | safe summary | — | S по grant | — |
 
-Browser напрямую читает только безопасные reference/projection данные. Финансовые и складские документы создаются через команды. Прямой `I/U/D` ledger tables для `authenticated` отсутствует.
+Browser напрямую читает только безопасные reference/projection данные. Seller с
+`pricing.view` видит только active price lists и effective-now product prices;
+history/recommendations требуют `pricing.manage/confirm`. `inventory.view`
+означает только authorized `inventory_balances`; raw documents/movements требуют
+`inventory.adjust/transfer`, а acquisition cost остаётся за
+`purchases.cost.view`.
+
+Raw `sync_commands`, `command_log`, `outbox_events`, `audit_events` и
+`sync_cursor_state` не имеют browser read surface; `sync_cursor_state` защищена
+RLS без browser policy/grant. `v2_my_activity_journal` показывает normal member
+только собственные безопасные audit fields, тогда как полный audit требует
+`audit.view`. Финансовые, складские, cash, sync, audit и outbox mutations
+остаются command/RPC-only: прямого `I/U/D` для `authenticated` нет. 0018 не
+добавляет permission codes и не реализует service-admin mutation как
+неограниченный browser DML.
 
 Helper functions с `security definer`, фиксированным `search_path=''` и минимальным execute grant:
 
@@ -2541,7 +2566,7 @@ technical audit/outbox event для каждого terminal sync command.
 | `0015_v2_debts_settlements.sql` | receivables, physical `debt_payments_v2`, signed allocations, settlement ledger/periods/immutable act snapshots | legacy `debt_payments` untouched; no backfill/dual-write | 0012,0014 | Debt and party ledger reconciliation by signed allocations/entries |
 | `0016_v2_shifts_cash.sql` | `cash_movements`, `shift_cash_counts`, unallocated `supplier_payments`; canonical shift open/close, safe journals and reconciliation | V1 shifts/payments/debt_payments retained; no backfill/dual-write | 0014–0015 | Register/shift serialization, signed payment-to-cash graph, zero-tolerance discrepancy approval, fiscal blocker; pending sync deferred to 0017 |
 | `0017_v2_sync_audit_outbox.sql` | `sync_commands`, per-tenant `sync_cursor_state`, static offline dispatcher, safe pull/ACK, technical audit and service-role outbox worker | legacy `sync_operations` retained and ignored; no V1 backfill/dual-write | 0007–0016 canonical domain RPC | Envelope replay/dependencies, domain rollback, cursor/ACK, pending-shift blocker, lease lifecycle and event reconciliation |
-| `0018_v2_rls.sql` | RLS helpers, policies, grants, defensive triggers | Revoke unsafe V2 grants only | tables/backfill helpers | Role matrix and cross-tenant test suite |
+| `0018_v2_rls.sql` | Финальная standard-RLS matrix; safe device/member/customer/activity projections; current-only pricing; projection-only seller inventory; exact-scope support и no-browser cursor | V1 tables/policies untouched; no backfill, no new permissions | 0007–0017 V2 tables/helpers | Real JWT tenant/branch/block/support threat matrix; raw-vs-safe redaction and direct-DML denial |
 | `0019_v2_backfill.sql` | idempotent backfill procedures/checkpoints | Reads V1, writes V2 | 0007–0018 | Dry run, exceptions, restartability |
 | `0020_v2_reconciliation.sql` | reconciliation views/functions/reports | Legacy frozen after acceptance | 0019 | Zero critical mismatch before feature flag |
 
