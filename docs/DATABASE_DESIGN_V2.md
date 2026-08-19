@@ -2249,6 +2249,13 @@ synthetic sale/payment. Exact customer→counterparty и store→branch mapping
 или opening debt. Обычный `v2_record_debt_payment` обслуживает оба вида и при
 пустом allocation строит явный oldest-first список по due date, source business
 date и UUID, сохраняя operation/register/settlement lock order и cash graph.
+Forward-only migration 0021 усиливает readiness: для каждого legacy customer
+одновременно проверяются суммы `original_amount` и текущего
+`outstanding_amount` opening receivables против неизменившегося
+`customers.current_debt`. Поэтому любой payment, write-off, allocation или
+offset до cutover readiness блокирует `OPENING_DEBT_COVERAGE`. Settlement
+position opening debt дополнительно пересчитывается из exact opening entry и
+signed allocations и должна совпадать с authoritative receivable outstanding.
 Только доказанная materialization автоматически resolves три opening codes;
 остальные open exceptions требуют отдельного owner-attributed service review.
 
@@ -2261,7 +2268,7 @@ flowchart LR
   Parties["Suppliers и customers в counterparties"]
   Assess["Cutover assessment без domain writes"]
   Reconcile["0020 reconciliation и freeze acceptance"]
-  Switch["Feature flag: V2 writer"]
+  Switch["Controlled application writer cutover"]
   Contract["Freeze legacy и future contract"]
 
   Snapshot --> Foundation --> Locations --> Catalog --> Parties --> Assess
@@ -2299,6 +2306,13 @@ cross-tenant integrity и отсутствие fake history. `ready` означ�
 успешное DB evidence: frontend routing и `organization_settings.settings`
 автоматически не меняются.
 
+Migration 0021 сохраняет все 24 check codes, но canonical
+`SETTLEMENT_ACT_RECONCILIATION` теперь полностью пересобирает snapshot по тому
+же контракту, что `v2_close_settlement_period`: ordering
+`business_date, created_at, id`, exact membership/count строк, `line_number`,
+`amount_delta`, opening/debit/credit/closing totals и SHA-256 `snapshot_hash`.
+Missing line, подмена суммы или hash всегда блокируют readiness.
+
 Отдельный service-only freeze требует exact confirmation
 `FREEZE_LEGACY_WRITES`, неизменный fingerprint, exact ready run/control, drained
 shift/sync/command queues, отсутствие open exceptions и failed blocker checks.
@@ -2309,12 +2323,26 @@ tables с `V2_LEGACY_WRITES_FROZEN`. Другие organizations и все V2 tab
 блокируются. General unfreeze API нет; recovery требует явного forward
 решения. Reconciliation не исправляет ledgers автоматически.
 
+Migration 0021 закрывает два race/bypass класса. UPDATE legacy row всегда
+разрешает tenant scope отдельно по OLD и NEW; frozen tenant нельзя обойти
+переносом product, customer, sale item или user-store link в незамороженный
+tenant. Перед финальным fingerprint и повторной проверкой shift/sync/command,
+exceptions и blocker checks `v2_freeze_legacy_for_cutover` вызывает статический
+`v2_lock_legacy_cutover_sources()` и получает `SHARE ROW EXCLUSIVE` relation
+locks на все 21 V1 source table в детерминированном порядке. Эти locks
+конфликтуют с обычными INSERT/UPDATE/DELETE и удерживаются до transaction end;
+только после повторной сверки записывается `legacy_frozen`. Helper недоступен
+`public`, `anon`, `authenticated` и `service_role`; dynamic SQL и unfreeze API
+отсутствуют.
+
 ## 75. Порядок migrations
 
-Текущий V2 database roadmap завершён migration 0020. Она не создаёт 0021, не
-формирует clean baseline, не squash/rewrite migrations 0001–0019 и сохраняет
-V1 transaction tables как historical evidence. Любой дальнейший contract или
-application writer cutover является отдельным утверждённым этапом.
+Основной V2 database roadmap завершён migration 0020. После её merge migration
+`0021_v2_cutover_hardening.sql` добавляет только forward-only corrective
+hardening reconciliation/freeze contract; 0020 и migrations 0001–0019 не
+переписываются. 0021 не формирует clean baseline, не выполняет squash и
+сохраняет V1 transaction tables как historical evidence. Application writer
+cutover остаётся отдельным утверждённым этапом.
 
 ### Реализованный контракт migration 0015
 
@@ -2678,6 +2706,7 @@ technical audit/outbox event для каждого terminal sync command.
 | `0018_v2_rls.sql` | Финальная standard-RLS matrix; safe device/member/customer/activity projections; current-only pricing; projection-only seller inventory; exact-scope support и no-browser cursor | V1 tables/policies untouched; no backfill, no new permissions | 0007–0017 V2 tables/helpers | Real JWT tenant/branch/block/support threat matrix; raw-vs-safe redaction and direct-DML denial |
 | `0019_v2_backfill.sql` | service-role dry-run/apply APIs; runs/checkpoints/mappings/findings; provable identity/access/location/catalog/counterparty/current-price state | V1 rows untouched; transactional history retained as evidence, no ledger/sync/audit reconstruction or dual-write | 0007–0018 | Logical snapshot staleness, ordered restartability, apply-only canonical exceptions; prepared is not cutover |
 | `0020_v2_reconciliation.sql` | full V1 fingerprint; reviewed opening stock/debt; exact opening batch/receivable sources; 24-check reconciliation matrix; optional physical V1 write freeze | V1 history retained; only explicit `legacy_frozen` blocks future V1 writes; no routing flag | Eligible 0019 apply run: prepared, or blocked only by three opening-review codes | Exact source/current-state materialization; ready/frozen evidence; no fake history, baseline or squash |
+| `0021_v2_cutover_hardening.sql` | forward-only debt/settlement-act reconciliation hardening; OLD+NEW freeze scope; static 21-relation final freeze barrier | 0020 unchanged; V1 history retained; no dual write, feature flag or unfreeze | merged 0020 contract and all 24 existing checks | Opening outstanding drift, canonical act tamper/missing line/hash, cross-tenant UPDATE escape and freeze/write race regressions |
 
 Forward recovery создаёт следующую migration; уже применённые файлы не переписываются. Destructive contract migration не входит в этот список и возможна после pilot retention.
 
