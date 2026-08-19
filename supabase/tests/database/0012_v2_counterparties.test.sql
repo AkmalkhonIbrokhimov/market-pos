@@ -121,7 +121,7 @@ select throws_ok($$insert into counterparties(organization_id,display_name,tax_i
 select set_config('market_pos.counterparty_command','off',true);
 
 set local role authenticated;
-select is((select count(*) from counterparties),2::bigint,'seller sees customer parties');
+select is((select count(*) from counterparties),0::bigint,'seller customer permission uses the safe directory instead of raw parties');
 select is((select count(*) from counterparties where display_name='Null1'),0::bigint,'seller hides supplierless');
 select is((select count(*) from counterparty_roles where role_code='supplier'),0::bigint,'seller hides supplier roles');
 reset role;
