@@ -2131,37 +2131,64 @@ erDiagram
 
 ## 73. Миграция V1 → V2
 
-Expand-and-contract, idempotent backfill, checkpoints и no rewrite старых migrations.
+Migration `0019_v2_backfill.sql` реализует expand-and-contract как
+контролируемый перенос **текущего master/configuration state**, а не как
+реконструкцию истории. Service-role оператор сначала запускает `dry_run`, затем
+после разбора findings — отдельный `apply`. Оба режима используют логический
+`source_snapshot_at`, детерминированный порядок ключей и checkpoints. Batch
+размером `1..1000` возобновляется с `last_legacy_key`; завершённая фаза и точный
+повтор являются no-op. Фазы выполняются строго в порядке: identity profiles,
+identity access, locations, categories, category parents, catalog references,
+products, counterparties, pricing, cutover assessment.
+
+`migration_backfill_runs`, `migration_backfill_checkpoints`,
+`migration_entity_mappings` и `migration_backfill_findings` — закрытое RLS
+evidence-пространство без browser policies и privileges. Mappings/findings
+append-only, hard delete запрещён. `dry_run` пишет только findings/checkpoints и
+никогда не пишет V2 master rows, mappings или `migration_exceptions`. `apply`
+записывает только доказуемые mappings; warning/blocker одновременно
+идемпотентно попадает в `migration_exceptions` с
+`migration_name = '0019_v2_backfill'`. `prepared` означает лишь готовность к
+следующей сверке и не переключает feature flag или authority.
 
 | V1 | V2 | Способ переноса | Проверка |
 | --- | --- | --- | --- |
-| organizations | organizations/settings | Сохранить UUID, заполнить UZS/timezone | Counts/status |
+| organizations | organizations/settings | Не дублировать root; создать отсутствующие defaults | Settings coverage |
 | stores | branches | Один branch, legacy_store_id | 1:1 mapping |
 | stores | primary warehouses | Один primary warehouse | Exactly one per branch |
 | stores | registers | Одна register с default warehouse | 1:1 and FK |
 | users | user_profiles | Auth mapping, убрать password hash | Unique non-null auth id exceptions |
 | users | memberships | Org + role/status | One active membership |
 | user_store_access | branch_access | Через store→branch mapping | Count and tenant |
-| categories | categories | Preserve IDs/hierarchy/archive | No cycles/orphans |
-| products | products | Preserve IDs, map refs/base unit | Required unit, no stock/price semantics |
+| categories | categories_v2 | Legacy mapping; parent только во втором проходе | No cycles/orphans/cross-tenant parent |
+| brands/units/product_types | *_v2 reference tables | Exact legacy mapping; deterministic missing codes | Unique mapping, tenant scope |
+| products | products_v2 | Safe master fields, mapped refs/base unit | Required unit, conflicts as findings |
 | products.barcode | product_barcodes | Primary barcode row | Duplicate report |
 | products.sale_price | initial product_prices/history | Initial confirmed version | One active price/product |
-| products.current_quantity | opening inventory documents | Opening delta in primary warehouse | Ledger sum equals legacy |
+| products.current_quantity | cutover finding only | Не переносить в ledger/balance | Reviewed opening-stock process in 0020 |
 | suppliers | counterparties/roles | Supplier role, mapping table | Counts and normalized duplicates |
 | customers | counterparties/roles/credit | Customer role; no unsafe auto-merge | Debt/customer linkage |
-| product_batches | synthetic purchase documents/lines/batches | Group deterministically by store/date/supplier | Quantity/cost totals |
-| stock_movements | migrated inventory movements | Link synthetic source or exception | Movement sums |
-| sales | sales | Preserve ids, map register/warehouse/shift | Header totals |
-| sale_items | sale_lines | Snapshot names/unit/cost | Sum lines |
-| payments | payments | Map methods; split invalid mixed to exception | Payments totals |
-| debt_entries | receivables/allocations | Reconstruct sale debt ledger | Outstanding reconciliation |
-| debt_payments | debt_payments/payments/allocations | Preserve operation ids | Customer totals |
-| shifts | shifts/totals | Store→register; recompute totals | Status and money |
-| devices | devices | Store→branch/register | Unique fingerprint fallback |
-| sync_operations | sync_commands/command_log | Preserve local id and payload hash | Duplicate/conflict report |
-| operation_logs | audit_events | Map actor/entity/data | Count and timestamp |
+| customer.current_debt | cutover finding only | Counterparty map без receivable/settlement | Reviewed opening-settlement process in 0020 |
+| devices | devices_v2 | Только validate явный legacy_device_id mapping | Иначе re-enrollment finding; fingerprint не синтезировать |
+| legacy transaction tables | retained V1 evidence | Только counts/date ranges в run summary | Никаких canonical domain writes |
 
-Неоднозначные supplier/customer merges, nullable auth ids, mixed payments, orphan batches и inconsistent totals попадают в `migration_exceptions`.
+Supplier и customer не объединяются автоматически даже при совпадении имени и
+телефона. Legacy device не получает synthesized fingerprint и не становится
+trusted: требуется re-enrollment. Ненулевой stock и существующий customer debt
+требуют отдельных reviewed opening procedures. V1 `sales`, `sale_items`,
+`payments`, `shifts`, `debt_payments`, `debt_entries`, `product_batches`,
+`stock_movements`, `operation_logs` и `sync_operations` остаются историческим
+evidence. 0019 не создаёт из них `sales_v2`, payments, purchase documents,
+inventory/debt/settlement/cash ledgers, sync commands, audit или outbox events и
+не вводит dual-write.
+
+Apply run — логический snapshot, а не PostgreSQL exported snapshot между
+transactions. Если relevant mutable V1 row создан или обновлён после
+`source_snapshot_at`, finalize возвращает
+`V2_BACKFILL_SOURCE_CHANGED_AFTER_SNAPSHOT` и фиксирует `stale`; оператор
+создаёт новый run. Blocker findings дают `blocked`, чистый apply — `prepared`.
+Только migration 0020 выполняет финальную reconciliation, freeze acceptance и
+cutover decision.
 
 ```mermaid
 flowchart LR
@@ -2170,15 +2197,15 @@ flowchart LR
   Locations["stores в branches, warehouses, registers"]
   Catalog["Catalog и pricing backfill"]
   Parties["Suppliers и customers в counterparties"]
-  Ledgers["Synthetic documents и ledgers"]
-  Shadow["Shadow reads и reconciliation"]
+  Assess["Cutover assessment без domain writes"]
+  Reconcile["0020 reconciliation и freeze acceptance"]
   Switch["Feature flag: V2 writer"]
   Contract["Freeze legacy и future contract"]
 
-  Snapshot --> Foundation --> Locations --> Catalog --> Parties --> Ledgers
-  Ledgers --> Shadow
-  Shadow -->|"Все checks прошли"| Switch
-  Shadow -->|"Exceptions"| Ledgers
+  Snapshot --> Foundation --> Locations --> Catalog --> Parties --> Assess
+  Assess --> Reconcile
+  Reconcile -->|"Все checks прошли"| Switch
+  Reconcile -->|"Exceptions или stale"| Snapshot
   Switch --> Contract
 ```
 
@@ -2567,8 +2594,8 @@ technical audit/outbox event для каждого terminal sync command.
 | `0016_v2_shifts_cash.sql` | `cash_movements`, `shift_cash_counts`, unallocated `supplier_payments`; canonical shift open/close, safe journals and reconciliation | V1 shifts/payments/debt_payments retained; no backfill/dual-write | 0014–0015 | Register/shift serialization, signed payment-to-cash graph, zero-tolerance discrepancy approval, fiscal blocker; pending sync deferred to 0017 |
 | `0017_v2_sync_audit_outbox.sql` | `sync_commands`, per-tenant `sync_cursor_state`, static offline dispatcher, safe pull/ACK, technical audit and service-role outbox worker | legacy `sync_operations` retained and ignored; no V1 backfill/dual-write | 0007–0016 canonical domain RPC | Envelope replay/dependencies, domain rollback, cursor/ACK, pending-shift blocker, lease lifecycle and event reconciliation |
 | `0018_v2_rls.sql` | Финальная standard-RLS matrix; safe device/member/customer/activity projections; current-only pricing; projection-only seller inventory; exact-scope support и no-browser cursor | V1 tables/policies untouched; no backfill, no new permissions | 0007–0017 V2 tables/helpers | Real JWT tenant/branch/block/support threat matrix; raw-vs-safe redaction and direct-DML denial |
-| `0019_v2_backfill.sql` | idempotent backfill procedures/checkpoints | Reads V1, writes V2 | 0007–0018 | Dry run, exceptions, restartability |
-| `0020_v2_reconciliation.sql` | reconciliation views/functions/reports | Legacy frozen after acceptance | 0019 | Zero critical mismatch before feature flag |
+| `0019_v2_backfill.sql` | service-role dry-run/apply APIs; runs/checkpoints/mappings/findings; provable identity/access/location/catalog/counterparty/current-price state | V1 rows untouched; transactional history retained as evidence, no ledger/sync/audit reconstruction or dual-write | 0007–0018 | Logical snapshot staleness, ordered restartability, apply-only canonical exceptions; prepared is not cutover |
+| `0020_v2_reconciliation.sql` | final reconciliation views/functions/reports, reviewed opening stock/debt acceptance and cutover gate | Legacy freeze only after explicit acceptance | 0019 prepared run | Zero critical mismatch before feature flag |
 
 Forward recovery создаёт следующую migration; уже применённые файлы не переписываются. Destructive contract migration не входит в этот список и возможна после pilot retention.
 
