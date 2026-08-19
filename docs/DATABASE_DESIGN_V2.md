@@ -2141,6 +2141,15 @@ Migration `0019_v2_backfill.sql` реализует expand-and-contract как
 identity access, locations, categories, category parents, catalog references,
 products, counterparties, pricing, cutover assessment.
 
+Строки V1 с `created_at`/`updated_at` участвуют в run только если оба relevant
+timestamp не новее `source_snapshot_at`; post-snapshot insert/update не создаёт
+V2 target или mapping этого run. Для источников без надёжного `updated_at`
+`summary.source_fingerprint` хранит tenant-scoped deterministic fingerprints:
+остатки и закупочную стоимость `product_batches`, immutable financial graph
+`sale_items` и identity set `user_store_access`. Изменение, вставка или удаление
+в этих наборах делает apply-run `stale`; изменившийся access set не используется
+для создания `branch_access`.
+
 `migration_backfill_runs`, `migration_backfill_checkpoints`,
 `migration_entity_mappings` и `migration_backfill_findings` — закрытое RLS
 evidence-пространство без browser policies и privileges. Mappings/findings
@@ -2150,6 +2159,23 @@ append-only, hard delete запрещён. `dry_run` пишет только fin
 идемпотентно попадает в `migration_exceptions` с
 `migration_name = '0019_v2_backfill'`. `prepared` означает лишь готовность к
 следующей сверке и не переключает feature flag или authority.
+
+Явный существующий V2 target не считается mapping только по совпадению
+`legacy_*`: проверяются tenant, legacy identity, ожидаемые catalog references,
+base unit, lifecycle и обязательная supplier/customer role. Несовместимость
+фиксируется как `V2_BACKFILL_TARGET_DIVERGED`/`V2_BACKFILL_MAPPING_CONFLICT`,
+independently managed V2 row не перезаписывается. Ненулевая legacy optional
+reference без доказуемого mapping не заменяется на `NULL`. Поэтому blocked run
+не может оставить incomplete product mapping, который свежий run ошибочно
+примет как готовый.
+
+`dry_run` выполняет ту же доступную без writes deterministic диагностику:
+tenant/reference/target divergence, SKU и normalized-barcode collisions,
+counterparty role mismatch и existing price divergence. Валидный явный
+`devices_v2.legacy_device_id` проверяется концептуально по tenant и branch без
+создания mapping; отсутствующий device по-прежнему получает warning о
+re-enrollment. Dry-run никогда не создаёт V2 rows, mappings или canonical
+exceptions.
 
 | V1 | V2 | Способ переноса | Проверка |
 | --- | --- | --- | --- |
@@ -2184,7 +2210,7 @@ inventory/debt/settlement/cash ledgers, sync commands, audit или outbox event
 
 Apply run — логический snapshot, а не PostgreSQL exported snapshot между
 transactions. Если relevant mutable V1 row создан или обновлён после
-`source_snapshot_at`, finalize возвращает
+`source_snapshot_at` либо deterministic fingerprint изменился, finalize возвращает
 `V2_BACKFILL_SOURCE_CHANGED_AFTER_SNAPSHOT` и фиксирует `stale`; оператор
 создаёт новый run. Blocker findings дают `blocked`, чистый apply — `prepared`.
 Только migration 0020 выполняет финальную reconciliation, freeze acceptance и

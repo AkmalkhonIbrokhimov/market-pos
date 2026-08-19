@@ -1,7 +1,7 @@
 begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path=public,extensions;
-select plan(393);
+select plan(435);
 
 -- Tooling schema is explicit, tenant-owned evidence with no browser surface.
 select has_table('public',t,'backfill table '||t||' exists')from(values
@@ -86,7 +86,8 @@ cross join(values('migration_backfill_runs'),('migration_backfill_checkpoints'),
 cross join(values('SELECT'),('INSERT'),('UPDATE'),('DELETE'))privs(p);
 
 with f(sig)as(values
- ('public.v2_guard_backfill_evidence()'),('public.v2_backfill_uuid_fragment(uuid)'),
+  ('public.v2_guard_backfill_evidence()'),('public.v2_backfill_uuid_fragment(uuid)'),
+  ('public.v2_backfill_source_fingerprint(uuid)'),
  ('public.v2_backfill_finding(uuid,text,text,text,text,text,jsonb)'),
  ('public.v2_backfill_mapping(uuid,text,text,text,uuid,text)'),
  ('public.v2_start_backfill_run(uuid,text)'),
@@ -94,7 +95,8 @@ with f(sig)as(values
  ('public.v2_finalize_backfill_run(uuid)'))
 select ok(to_regprocedure(sig)is not null,sig||' exists')from f;
 with f(sig)as(values
- ('public.v2_guard_backfill_evidence()'),('public.v2_backfill_uuid_fragment(uuid)'),
+  ('public.v2_guard_backfill_evidence()'),('public.v2_backfill_uuid_fragment(uuid)'),
+  ('public.v2_backfill_source_fingerprint(uuid)'),
  ('public.v2_backfill_finding(uuid,text,text,text,text,text,jsonb)'),
  ('public.v2_backfill_mapping(uuid,text,text,text,uuid,text)'),
  ('public.v2_start_backfill_run(uuid,text)'),
@@ -102,7 +104,8 @@ with f(sig)as(values
  ('public.v2_finalize_backfill_run(uuid)'))
 select ok((select array_to_string(proconfig,',')='search_path=""'from pg_proc where oid=sig::regprocedure),sig||' has empty search_path')from f;
 with f(sig)as(values
- ('public.v2_guard_backfill_evidence()'),('public.v2_backfill_uuid_fragment(uuid)'),
+  ('public.v2_guard_backfill_evidence()'),('public.v2_backfill_uuid_fragment(uuid)'),
+  ('public.v2_backfill_source_fingerprint(uuid)'),
  ('public.v2_backfill_finding(uuid,text,text,text,text,text,jsonb)'),
  ('public.v2_backfill_mapping(uuid,text,text,text,uuid,text)'),
  ('public.v2_start_backfill_run(uuid,text)'),
@@ -114,7 +117,8 @@ with f(sig)as(values('public.v2_start_backfill_run(uuid,text)'),
  ('public.v2_run_backfill_batch(uuid,text,integer)'),('public.v2_finalize_backfill_run(uuid)'))
 select ok(has_function_privilege('service_role',sig,'EXECUTE'),'service_role executes '||sig)from f;
 with f(sig)as(values('public.v2_guard_backfill_evidence()'),
- ('public.v2_backfill_uuid_fragment(uuid)'),('public.v2_backfill_finding(uuid,text,text,text,text,text,jsonb)'),
+ ('public.v2_backfill_uuid_fragment(uuid)'),('public.v2_backfill_source_fingerprint(uuid)'),
+ ('public.v2_backfill_finding(uuid,text,text,text,text,text,jsonb)'),
  ('public.v2_backfill_mapping(uuid,text,text,text,uuid,text)'))
 select ok(not has_function_privilege('service_role',sig,'EXECUTE'),'service_role cannot call internal '||sig)from f;
 
@@ -356,13 +360,22 @@ select is((select count(*)from migration_exceptions e where e.organization_id='0
 -- and creates no duplicate location, catalog or pricing rows.
 create temp table retry_counts(name text primary key,value bigint not null);
 insert into retry_counts values
- ('exceptions',(select count(*)from migration_exceptions where organization_id='00000000-0000-0000-0000-000000019101'and migration_name='0019_v2_backfill'));
+ ('exceptions',(select count(*)from migration_exceptions where organization_id='00000000-0000-0000-0000-000000019101'and migration_name='0019_v2_backfill')),
+ ('mappings',(select count(*)from migration_entity_mappings where organization_id='00000000-0000-0000-0000-000000019101'));
 insert into devices_v2(id,organization_id,branch_id,register_id,legacy_device_id,name,device_type,fingerprint_hash,status)
 select '00000000-0000-0000-0000-000000019901',b.organization_id,b.id,r.id,
   '00000000-0000-0000-0000-000000019421','Re-enrolled Device','desktop','reenrolled-19','pending'
 from branches b join registers r on r.branch_id=b.id
 where b.legacy_store_id='00000000-0000-0000-0000-000000019401';
 update products set sale_price=125 where id='00000000-0000-0000-0000-000000019701';
+insert into test_runs values('device_dry',v2_start_backfill_run('00000000-0000-0000-0000-000000019101','dry_run'));
+select lives_ok(format('select pg_temp.run_backfill(%L,2)',(select id from test_runs where name='device_dry')),'dry-run validates existing targets without writes');
+select is((select count(*)from migration_backfill_findings where run_id=(select id from test_runs where name='device_dry')and legacy_table='devices'and error_code='V2_BACKFILL_MAPPING_CONFLICT'),0::bigint,'valid pre-existing device creates no dry-run mapping blocker');
+select is((select count(*)from migration_entity_mappings where organization_id='00000000-0000-0000-0000-000000019101'),(select value from retry_counts where name='mappings'),'dry-run creates no mapping beside existing evidence');
+select is((select count(*)from migration_exceptions where organization_id='00000000-0000-0000-0000-000000019101'and migration_name='0019_v2_backfill'),(select value from retry_counts where name='exceptions'),'dry-run creates no canonical exception');
+select is((select count(*)from migration_backfill_findings where run_id=(select id from test_runs where name='device_dry')and error_code='V2_BACKFILL_SKU_CONFLICT'),1::bigint,'dry-run predicts deterministic SKU conflict');
+select is((select count(*)from migration_backfill_findings where run_id=(select id from test_runs where name='device_dry')and error_code='V2_BACKFILL_BARCODE_CONFLICT'),1::bigint,'dry-run predicts normalized barcode conflict');
+select is((select count(*)from migration_backfill_findings where run_id=(select id from test_runs where name='device_dry')and error_code='V2_BACKFILL_PRICE_TARGET_DIVERGED'),1::bigint,'dry-run predicts existing price divergence');
 insert into test_runs values('retry',v2_start_backfill_run('00000000-0000-0000-0000-000000019101','apply'));
 select lives_ok(format('select pg_temp.run_backfill(%L,2)',(select id from test_runs where name='retry')),'second apply is restartable');
 select is(v2_run_backfill_batch((select id from test_runs where name='retry'),'pricing',2)->>'replayed','true','completed apply phase retry is no-op');
@@ -379,6 +392,7 @@ select is((select count(*)from migration_backfill_findings where run_id=(select 
 select is((select amount from product_prices pp join products_v2 p on p.id=pp.product_id where p.legacy_product_id='00000000-0000-0000-0000-000000019701'),100::numeric,'managed V2 price is not overwritten');
 select is((select count(*)from migration_exceptions where organization_id='00000000-0000-0000-0000-000000019101'and migration_name='0019_v2_backfill'),(select value+1 from retry_counts where name='exceptions'),'retry adds only the newly introduced price-divergence exception');
 select ok(not exists(select 1 from migration_entity_mappings where organization_id='00000000-0000-0000-0000-000000019101'group by legacy_table,legacy_key,target_table having count(*)>1),'mapping identity remains unique across retries');
+select results_eq($$select distinct error_code from migration_backfill_findings where run_id=(select id from test_runs where name='device_dry')and error_code in('V2_BACKFILL_SKU_CONFLICT','V2_BACKFILL_BARCODE_CONFLICT','V2_BACKFILL_PRICE_TARGET_DIVERGED')order by 1$$,$$select distinct error_code from migration_backfill_findings where run_id=(select id from test_runs where name='retry')and error_code in('V2_BACKFILL_SKU_CONFLICT','V2_BACKFILL_BARCODE_CONFLICT','V2_BACKFILL_PRICE_TARGET_DIVERGED')order by 1$$,'dry-run and apply report the same deterministic conflict codes');
 
 -- Category source graph validation is independent of target write order.
 insert into organizations(id,name,created_at,updated_at)values
@@ -414,6 +428,70 @@ select is((select count(*)from branches where organization_id='00000000-0000-000
 select is((select count(*)from warehouses where organization_id='00000000-0000-0000-0000-000000019107'),1::bigint,'manual warehouse is not overwritten');
 select is((select count(*)from registers where organization_id='00000000-0000-0000-0000-000000019107'),0::bigint,'ambiguous location creates no guessed register');
 
+-- Existing V2 targets are accepted only when their tenant, legacy identity,
+-- reference graph, lifecycle and required counterparty role remain compatible.
+insert into organizations(id,name,created_at,updated_at)values
+ ('00000000-0000-0000-0000-000000019108','Target Validation',now()-interval'3 days',now()-interval'3 days');
+insert into stores(id,organization_id,name,status,created_at,updated_at)values
+ ('00000000-0000-0000-0000-000000019408','00000000-0000-0000-0000-000000019108','Target Store','active',now()-interval'2 days',now()-interval'2 days');
+insert into categories(id,organization_id,name,status,created_at,updated_at)values
+ ('00000000-0000-0000-0000-000000019518','00000000-0000-0000-0000-000000019108','Expected Category','active',now()-interval'2 days',now()-interval'2 days'),
+ ('00000000-0000-0000-0000-000000019519','00000000-0000-0000-0000-000000019108','Wrong Category','active',now()-interval'2 days',now()-interval'2 days');
+insert into brands(id,organization_id,name,status,created_at,updated_at)values
+ ('00000000-0000-0000-0000-000000019618','00000000-0000-0000-0000-000000019108','Target Brand','active',now()-interval'2 days',now()-interval'2 days');
+insert into units(id,organization_id,name,short_name,status,created_at,updated_at)values
+ ('00000000-0000-0000-0000-000000019619','00000000-0000-0000-0000-000000019108','Target Unit','tu','active',now()-interval'2 days',now()-interval'2 days');
+insert into product_types(id,organization_id,name,code,status,created_at,updated_at)values
+ ('00000000-0000-0000-0000-000000019620','00000000-0000-0000-0000-000000019108','Target Type',null,'active',now()-interval'2 days',now()-interval'2 days');
+insert into products(id,organization_id,category_id,name,unit,sale_price,status,brand_id,product_type_id,unit_id,created_at,updated_at)values
+ ('00000000-0000-0000-0000-000000019718','00000000-0000-0000-0000-000000019108','00000000-0000-0000-0000-000000019518','Wrong Category Product','tu',10,'active','00000000-0000-0000-0000-000000019618','00000000-0000-0000-0000-000000019620','00000000-0000-0000-0000-000000019619',now()-interval'2 days',now()-interval'2 days'),
+ ('00000000-0000-0000-0000-000000019719','00000000-0000-0000-0000-000000019108','00000000-0000-0000-0000-000000019518','Missing Reference Product','tu',20,'active','00000000-0000-0000-0000-000000019618','00000000-0000-0000-0000-000000019620','00000000-0000-0000-0000-000000019619',now()-interval'2 days',now()-interval'2 days');
+insert into categories_v2(id,organization_id,legacy_category_id,name,status)values
+ ('00000000-0000-0000-0000-000000019528','00000000-0000-0000-0000-000000019108','00000000-0000-0000-0000-000000019518','Expected Category','active'),
+ ('00000000-0000-0000-0000-000000019529','00000000-0000-0000-0000-000000019108','00000000-0000-0000-0000-000000019519','Wrong Category','active');
+insert into brands_v2(id,organization_id,legacy_brand_id,name,status)values
+ ('00000000-0000-0000-0000-000000019628','00000000-0000-0000-0000-000000019108','00000000-0000-0000-0000-000000019618','Target Brand','active');
+insert into units_v2(id,organization_id,legacy_unit_id,code,name,short_name,status)values
+ ('00000000-0000-0000-0000-000000019629','00000000-0000-0000-0000-000000019108','00000000-0000-0000-0000-000000019619','MIG-U-000000019619','Target Unit','tu','active');
+insert into product_types_v2(id,organization_id,legacy_product_type_id,code,name,status)values
+ ('00000000-0000-0000-0000-000000019630','00000000-0000-0000-0000-000000019108','00000000-0000-0000-0000-000000019620','MIG-T-000000019620','Target Type','active');
+insert into products_v2(id,organization_id,legacy_product_id,name,category_id,brand_id,product_type_id,base_unit_id,status)values
+ ('00000000-0000-0000-0000-000000019728','00000000-0000-0000-0000-000000019108','00000000-0000-0000-0000-000000019718','Wrong Category Product','00000000-0000-0000-0000-000000019529','00000000-0000-0000-0000-000000019628','00000000-0000-0000-0000-000000019630','00000000-0000-0000-0000-000000019629','active'),
+ ('00000000-0000-0000-0000-000000019729','00000000-0000-0000-0000-000000019108','00000000-0000-0000-0000-000000019719','Missing Reference Product','00000000-0000-0000-0000-000000019528',null,null,'00000000-0000-0000-0000-000000019629','active');
+insert into customers(id,store_id,full_name,status,created_at,updated_at)values
+ ('00000000-0000-0000-0000-000000019818','00000000-0000-0000-0000-000000019408','Missing Customer Role','active',now()-interval'2 days',now()-interval'2 days');
+insert into suppliers(id,organization_id,name,status,created_at,updated_at)values
+ ('00000000-0000-0000-0000-000000019819','00000000-0000-0000-0000-000000019108','Compatible Supplier','active',now()-interval'2 days',now()-interval'2 days');
+select set_config('market_pos.counterparty_command','on',true);
+insert into counterparties(id,organization_id,legacy_customer_id,display_name,status)values
+ ('00000000-0000-0000-0000-000000019918','00000000-0000-0000-0000-000000019108','00000000-0000-0000-0000-000000019818','Missing Customer Role','active');
+insert into counterparties(id,organization_id,legacy_supplier_id,display_name,status)values
+ ('00000000-0000-0000-0000-000000019919','00000000-0000-0000-0000-000000019108','00000000-0000-0000-0000-000000019819','Compatible Supplier','active');
+insert into counterparty_roles(organization_id,counterparty_id,role_code,started_at)values
+ ('00000000-0000-0000-0000-000000019108','00000000-0000-0000-0000-000000019919','supplier',now()-interval'2 days');
+select set_config('market_pos.counterparty_command','off',true);
+
+insert into test_runs values('target_dry',v2_start_backfill_run('00000000-0000-0000-0000-000000019108','dry_run'));
+select lives_ok(format('select pg_temp.run_backfill(%L,200)',(select id from test_runs where name='target_dry')),'dry-run evaluates existing target compatibility');
+select is((select count(*)from migration_backfill_findings where run_id=(select id from test_runs where name='target_dry')and error_code='V2_BACKFILL_TARGET_DIVERGED'),3::bigint,'dry-run predicts two product and one role divergence');
+select is((select count(*)from migration_entity_mappings where organization_id='00000000-0000-0000-0000-000000019108'),0::bigint,'target-validation dry-run creates no mappings');
+select is((select count(*)from migration_exceptions where organization_id='00000000-0000-0000-0000-000000019108'and migration_name='0019_v2_backfill'),0::bigint,'target-validation dry-run creates no canonical exceptions');
+
+insert into test_runs values('target_apply',v2_start_backfill_run('00000000-0000-0000-0000-000000019108','apply'));
+select lives_ok(format('select pg_temp.run_backfill(%L,200)',(select id from test_runs where name='target_apply')),'apply isolates divergent existing targets');
+select is((select count(*)from migration_backfill_findings where run_id=(select id from test_runs where name='target_apply')and error_code='V2_BACKFILL_TARGET_DIVERGED'and legacy_id='00000000-0000-0000-0000-000000019718'),1::bigint,'existing product with wrong category is blocked');
+select is((select count(*)from migration_backfill_findings where run_id=(select id from test_runs where name='target_apply')and error_code='V2_BACKFILL_TARGET_DIVERGED'and legacy_id='00000000-0000-0000-0000-000000019719'),1::bigint,'existing product missing brand and type is blocked');
+select is((select count(*)from migration_backfill_findings where run_id=(select id from test_runs where name='target_apply')and error_code='V2_BACKFILL_TARGET_DIVERGED'and legacy_id='00000000-0000-0000-0000-000000019818'),1::bigint,'existing customer without customer role is blocked');
+select is((select count(*)from migration_entity_mappings where organization_id='00000000-0000-0000-0000-000000019108'and legacy_table='products'),0::bigint,'divergent products never receive mapping evidence');
+select is((select count(*)from migration_entity_mappings where organization_id='00000000-0000-0000-0000-000000019108'and legacy_table='suppliers'and legacy_key='00000000-0000-0000-0000-000000019819'),1::bigint,'compatible existing counterparty maps idempotently');
+select is((select count(*)from counterparties where organization_id='00000000-0000-0000-0000-000000019108'and legacy_supplier_id='00000000-0000-0000-0000-000000019819'),1::bigint,'compatible counterparty target is not duplicated');
+select results_eq($$select legacy_id,error_code from migration_backfill_findings where run_id=(select id from test_runs where name='target_dry')and error_code='V2_BACKFILL_TARGET_DIVERGED'order by legacy_id$$,$$select legacy_id,error_code from migration_backfill_findings where run_id=(select id from test_runs where name='target_apply')and error_code='V2_BACKFILL_TARGET_DIVERGED'order by legacy_id$$,'dry-run and apply report identical target divergence codes');
+insert into test_runs values('target_retry',v2_start_backfill_run('00000000-0000-0000-0000-000000019108','apply'));
+select lives_ok(format('select pg_temp.run_backfill(%L,200)',(select id from test_runs where name='target_retry')),'fresh apply does not accept incomplete prior targets');
+select is((select count(*)from migration_backfill_findings where run_id=(select id from test_runs where name='target_retry')and error_code='V2_BACKFILL_TARGET_DIVERGED'),3::bigint,'fresh apply retains every deterministic divergence');
+select is((select count(*)from migration_entity_mappings where organization_id='00000000-0000-0000-0000-000000019108'and legacy_table='products'),0::bigint,'blocked run cannot seed incomplete product mappings for retry');
+select is(v2_finalize_backfill_run((select id from test_runs where name='target_retry'))->>'status','blocked','fresh run with unresolved target divergence remains blocked');
+
 insert into test_runs values('incomplete',v2_start_backfill_run('00000000-0000-0000-0000-000000019106','dry_run'));
 select throws_ok(format('select v2_finalize_backfill_run(%L)',(select id from test_runs where name='incomplete')),'P0001','V2_BACKFILL_PHASES_INCOMPLETE','finalize requires every phase complete');
 
@@ -434,6 +512,49 @@ select lives_ok(format('select pg_temp.run_backfill(%L,200)',(select id from tes
 select is(v2_finalize_backfill_run((select id from test_runs where name='stale'))->>'error_code','V2_BACKFILL_SOURCE_CHANGED_AFTER_SNAPSHOT','source change returns stable stale error');
 select is((select status from migration_backfill_runs where id=(select id from test_runs where name='stale')),'stale','source change persists stale status');
 select ok((select summary ? 'final_error'from migration_backfill_runs where id=(select id from test_runs where name='stale')),'stale summary records final error');
+
+-- Timestamp filters prevent post-snapshot master rows from being mapped, while
+-- fingerprints close mutation/deletion blind spots in legacy rows without updated_at.
+insert into auth.users(instance_id,id,aud,role,email,encrypted_password,email_confirmed_at,created_at,updated_at)values
+ ('00000000-0000-0000-0000-000000000000','00000000-0000-0000-0000-000000019209','authenticated','authenticated','snapshot-19@test.local','',now(),now()-interval'3 days',now()-interval'3 days');
+insert into organizations(id,name,created_at,updated_at)values
+ ('00000000-0000-0000-0000-000000019109','Snapshot Discipline',now()-interval'3 days',now()-interval'3 days');
+insert into users(id,auth_user_id,organization_id,full_name,email,role,status,created_at,updated_at)values
+ ('00000000-0000-0000-0000-000000019309','00000000-0000-0000-0000-000000019209','00000000-0000-0000-0000-000000019109','Snapshot Seller','snapshot-19@test.local','seller','active',now()-interval'2 days',now()-interval'2 days');
+insert into stores(id,organization_id,name,status,created_at,updated_at)values
+ ('00000000-0000-0000-0000-000000019409','00000000-0000-0000-0000-000000019109','Snapshot Store','active',now()-interval'2 days',now()-interval'2 days');
+insert into user_store_access(id,user_id,store_id,role_in_store,created_at)values
+ ('00000000-0000-0000-0000-000000019419','00000000-0000-0000-0000-000000019309','00000000-0000-0000-0000-000000019409','seller',now()-interval'2 days');
+insert into products(id,organization_id,name,unit,sale_price,current_quantity,status,created_at,updated_at)values
+ ('00000000-0000-0000-0000-000000019709','00000000-0000-0000-0000-000000019109','Snapshot Product','sp',10,2,'active',now()-interval'2 days',now()-interval'2 days');
+insert into product_batches(id,store_id,product_id,initial_quantity,remaining_quantity,purchase_price,sale_price_at_arrival,created_at)values
+ ('00000000-0000-0000-0000-000000019819','00000000-0000-0000-0000-000000019409','00000000-0000-0000-0000-000000019709',2,2,5,10,now()-interval'2 days');
+insert into sales(id,store_id,seller_id,type,payment_status,total_amount,status,created_at,updated_at)values
+ ('00000000-0000-0000-0000-000000019839','00000000-0000-0000-0000-000000019409','00000000-0000-0000-0000-000000019309','regular','paid',10,'completed',now()-interval'2 days',now()-interval'2 days');
+insert into sale_items(id,sale_id,product_id,quantity,purchase_price,sale_price,total_price,profit_amount)values
+ ('00000000-0000-0000-0000-000000019849','00000000-0000-0000-0000-000000019839','00000000-0000-0000-0000-000000019709',1,5,10,10,5);
+insert into test_runs values('snapshot',v2_start_backfill_run('00000000-0000-0000-0000-000000019109','apply'));
+select is((select count(*)from jsonb_object_keys((select summary->'source_fingerprint'from migration_backfill_runs where id=(select id from test_runs where name='snapshot')))),3::bigint,'run captures all three tenant-scoped source fingerprints');
+insert into products(id,organization_id,name,unit,sale_price,status,created_at,updated_at)values
+ ('00000000-0000-0000-0000-000000019710','00000000-0000-0000-0000-000000019109','Created After Snapshot','sp',12,'active',clock_timestamp()+interval'1 second',clock_timestamp()+interval'1 second');
+alter table products disable trigger trg_products_updated_at;
+update products set name='Post Snapshot Name',updated_at=clock_timestamp()+interval'1 second'
+where id='00000000-0000-0000-0000-000000019709';
+alter table products enable trigger trg_products_updated_at;
+update product_batches set remaining_quantity=1 where id='00000000-0000-0000-0000-000000019819';
+update sale_items set total_price=9,profit_amount=4 where id='00000000-0000-0000-0000-000000019849';
+delete from user_store_access where id='00000000-0000-0000-0000-000000019419';
+select lives_ok(format('select pg_temp.run_backfill(%L,200)',(select id from test_runs where name='snapshot')),'stale snapshot scan keeps checkpoints and evidence');
+select is((select count(*)from migration_entity_mappings where organization_id='00000000-0000-0000-0000-000000019109'and legacy_table='products'and legacy_key='00000000-0000-0000-0000-000000019710'),0::bigint,'product created after snapshot is not mapped');
+select is((select count(*)from products_v2 where legacy_product_id='00000000-0000-0000-0000-000000019710'),0::bigint,'post-snapshot product creates no V2 target');
+select is((select count(*)from migration_entity_mappings where organization_id='00000000-0000-0000-0000-000000019109'and legacy_table='products'and legacy_key='00000000-0000-0000-0000-000000019709'),0::bigint,'product updated after snapshot is not mapped');
+select is((select count(*)from products_v2 where legacy_product_id='00000000-0000-0000-0000-000000019709'),0::bigint,'post-snapshot product values are not copied');
+select isnt((select summary->'source_fingerprint'->>'product_batches'from migration_backfill_runs where id=(select id from test_runs where name='snapshot')),(v2_backfill_source_fingerprint('00000000-0000-0000-0000-000000019109')->>'product_batches'),'remaining quantity mutation changes batch fingerprint');
+select isnt((select summary->'source_fingerprint'->>'sale_items'from migration_backfill_runs where id=(select id from test_runs where name='snapshot')),(v2_backfill_source_fingerprint('00000000-0000-0000-0000-000000019109')->>'sale_items'),'sale item financial mutation changes history fingerprint');
+select isnt((select summary->'source_fingerprint'->>'user_store_access'from migration_backfill_runs where id=(select id from test_runs where name='snapshot')),(v2_backfill_source_fingerprint('00000000-0000-0000-0000-000000019109')->>'user_store_access'),'access removal changes identity-set fingerprint');
+select is((select count(*)from branch_access where organization_id='00000000-0000-0000-0000-000000019109'),0::bigint,'changed access set creates no branch access target');
+select is(v2_finalize_backfill_run((select id from test_runs where name='snapshot'))->>'error_code','V2_BACKFILL_SOURCE_CHANGED_AFTER_SNAPSHOT','fingerprint or timestamp change returns stable stale error');
+select is((select status from migration_backfill_runs where id=(select id from test_runs where name='snapshot')),'stale','snapshot discipline persists stale run status');
 
 -- Evidence is append-only and API inputs remain defensive.
 select throws_ok(format('delete from migration_entity_mappings where id=%L',(select id from migration_entity_mappings where organization_id='00000000-0000-0000-0000-000000019101'limit 1)),'P0001','V2_BACKFILL_HARD_DELETE_FORBIDDEN','mapping hard delete guarded');
