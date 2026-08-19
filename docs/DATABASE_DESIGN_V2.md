@@ -2216,6 +2216,42 @@ transactions. Если relevant mutable V1 row создан или обновл�
 Только migration 0020 выполняет финальную reconciliation, freeze acceptance и
 cutover decision.
 
+Migration `0020_v2_reconciliation.sql` принимает не только `prepared` apply-run
+0019. Run со статусом `blocked` также допустим, но исключительно когда каждый
+blocker имеет один из трёх кодов:
+`V2_BACKFILL_OPENING_STOCK_REVIEW_REQUIRED`,
+`V2_BACKFILL_STOCK_SOURCE_MISMATCH` или
+`V2_BACKFILL_OPENING_DEBT_REVIEW_REQUIRED`. Любой structural/auth/mapping,
+open-shift, pending-sync или иной blocker делает run непригодным с
+`V2_CUTOVER_BACKFILL_NOT_ELIGIBLE`; исторический status/findings 0019 при этом
+не переписываются. До старта повторяются timestamp checks 0019 и его три
+fingerprints. Затем 0020 фиксирует отдельный tenant-scoped fingerprint из
+counts/hashes по 21 authoritative V1 table; raw private values и password hash
+в evidence не попадают. Любое последующее V1 изменение даёт
+`V2_CUTOVER_SOURCE_CHANGED`/`stale` и требует нового controlled run.
+
+Opening stock — новый явно reviewed inventory opening document на дату
+cutover, а не восстановленная historical purchase. Доказуемая положительная
+batch-distribution предлагается автоматически; неоднозначный остаток требует
+manual line с reason, tenant-safe branch/warehouse/product graph и точным
+совпадением с `products.current_quantity`. Expirable product нельзя принять
+без expiry. `product_batches_v2` поэтому имеет exact-one source:
+`purchase_line_id` **или** `opening_stock_line_id`. Materialization создаёт
+opening document/line, opening batch, canonical inventory movement, batch и
+aggregate balance, audit/outbox evidence; replay не создаёт дублей и никогда
+не создаёт synthetic purchase.
+
+Opening debt аналогично является новым reviewed receivable source, а не
+synthetic sale/payment. Exact customer→counterparty и store→branch mapping
+создаёт proposal на `customers.current_debt`; после owner review materialization
+создаёт receivable с `sale_id IS NULL`, exact `opening_debt_id` и положительную
+`settlement_entries(opening_debt)`. Receivable имеет exact-one source — sale
+или opening debt. Обычный `v2_record_debt_payment` обслуживает оба вида и при
+пустом allocation строит явный oldest-first список по due date, source business
+date и UUID, сохраняя operation/register/settlement lock order и cash graph.
+Только доказанная materialization автоматически resolves три opening codes;
+остальные open exceptions требуют отдельного owner-attributed service review.
+
 ```mermaid
 flowchart LR
   Snapshot["Backup и V1 snapshot"]
@@ -2254,11 +2290,31 @@ flowchart LR
 - cross-tenant FK query returns zero;
 - migration exceptions classified and approved.
 
-Reconciliation jobs пишут result/cutoff, но не исправляют ledgers автоматически.
+0020 записывает append-only matrix из 24 blocker checks: backfill eligibility и
+mapping coverage, classification exceptions, nonnegative/exact opening stock,
+aggregate/batch/ledger inventory projections, opening debt/receivable/settlement
+formulae, pricing/location/device readiness, legacy/V2 shift и sync drain,
+command queue, shift ledger, settlement acts, audit/outbox coverage,
+cross-tenant integrity и отсутствие fake history. `ready` означает только
+успешное DB evidence: frontend routing и `organization_settings.settings`
+автоматически не меняются.
 
-## 75. Порядок будущих migrations
+Отдельный service-only freeze требует exact confirmation
+`FREEZE_LEGACY_WRITES`, неизменный fingerprint, exact ready run/control, drained
+shift/sync/command queues, отсутствие open exceptions и failed blocker checks.
+После него `cutover_controls.state = legacy_frozen`, run становится `frozen`,
+эмитируется `LegacyWritesFrozenForCutover`, а статические BEFORE triggers
+физически запрещают INSERT/UPDATE/DELETE во всех перечисленных mutable V1
+tables с `V2_LEGACY_WRITES_FROZEN`. Другие organizations и все V2 tables не
+блокируются. General unfreeze API нет; recovery требует явного forward
+решения. Reconciliation не исправляет ledgers автоматически.
 
-Файлы предлагаются, но на этом этапе не создаются.
+## 75. Порядок migrations
+
+Текущий V2 database roadmap завершён migration 0020. Она не создаёт 0021, не
+формирует clean baseline, не squash/rewrite migrations 0001–0019 и сохраняет
+V1 transaction tables как historical evidence. Любой дальнейший contract или
+application writer cutover является отдельным утверждённым этапом.
 
 ### Реализованный контракт migration 0015
 
@@ -2621,7 +2677,7 @@ technical audit/outbox event для каждого terminal sync command.
 | `0017_v2_sync_audit_outbox.sql` | `sync_commands`, per-tenant `sync_cursor_state`, static offline dispatcher, safe pull/ACK, technical audit and service-role outbox worker | legacy `sync_operations` retained and ignored; no V1 backfill/dual-write | 0007–0016 canonical domain RPC | Envelope replay/dependencies, domain rollback, cursor/ACK, pending-shift blocker, lease lifecycle and event reconciliation |
 | `0018_v2_rls.sql` | Финальная standard-RLS matrix; safe device/member/customer/activity projections; current-only pricing; projection-only seller inventory; exact-scope support и no-browser cursor | V1 tables/policies untouched; no backfill, no new permissions | 0007–0017 V2 tables/helpers | Real JWT tenant/branch/block/support threat matrix; raw-vs-safe redaction and direct-DML denial |
 | `0019_v2_backfill.sql` | service-role dry-run/apply APIs; runs/checkpoints/mappings/findings; provable identity/access/location/catalog/counterparty/current-price state | V1 rows untouched; transactional history retained as evidence, no ledger/sync/audit reconstruction or dual-write | 0007–0018 | Logical snapshot staleness, ordered restartability, apply-only canonical exceptions; prepared is not cutover |
-| `0020_v2_reconciliation.sql` | final reconciliation views/functions/reports, reviewed opening stock/debt acceptance and cutover gate | Legacy freeze only after explicit acceptance | 0019 prepared run | Zero critical mismatch before feature flag |
+| `0020_v2_reconciliation.sql` | full V1 fingerprint; reviewed opening stock/debt; exact opening batch/receivable sources; 24-check reconciliation matrix; optional physical V1 write freeze | V1 history retained; only explicit `legacy_frozen` blocks future V1 writes; no routing flag | Eligible 0019 apply run: prepared, or blocked only by three opening-review codes | Exact source/current-state materialization; ready/frozen evidence; no fake history, baseline or squash |
 
 Forward recovery создаёт следующую migration; уже применённые файлы не переписываются. Destructive contract migration не входит в этот список и возможна после pilot retention.
 
